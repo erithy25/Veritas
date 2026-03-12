@@ -326,8 +326,9 @@ async fn score_and_emit(
     let envelope = KafkaEnvelope::new(acc.tenant_id, *scan_id, &scan_result);
     let payload = serde_json::to_string(&envelope)?;
 
+    let key = scan_id.to_string();
     let record = FutureRecord::to(topics::VERDICTS)
-        .key(&scan_id.to_string())
+        .key(&key)
         .payload(&payload);
 
     producer

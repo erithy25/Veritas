@@ -365,7 +365,7 @@ pub async fn store_reference_hashes(
         .zadd(REDIS_KEY_AHASH, reference_id, hashes.ahash as f64)
         .zadd(REDIS_KEY_DHASH, reference_id, hashes.dhash as f64)
         .zadd(REDIS_KEY_PHASH, reference_id, hashes.phash as f64)
-        .query_async(conn)
+        .query_async::<()>(conn)
         .await
         .context("Failed to store reference hashes in Redis")?;
 

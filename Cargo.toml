@@ -8,6 +8,7 @@ members = [
     "services/scorer",
     "services/signer",
     "services/compliance",
+    "services/test-harness",
 ]
 
 [workspace.package]
@@ -43,11 +44,11 @@ opentelemetry-otlp = "0.17"
 rdkafka = { version = "0.36", features = ["cmake-build", "ssl"] }
 
 # Redis
-redis = { version = "0.27", features = ["tokio-comp", "cluster-async", "tls-rustls"] }
+redis = { version = "0.27", features = ["tokio-comp", "cluster-async"] }
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json"] }
-clickhouse = { version = "0.13", features = ["tls"] }
+clickhouse = { version = "0.13" }
 
 # Cryptography
 ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }

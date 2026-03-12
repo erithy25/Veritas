@@ -154,9 +154,10 @@ async fn process_verdict(
             "timestamp": chrono::Utc::now().to_rfc3339(),
         });
 
+        let event_payload = serde_json::to_vec(&event)?;
         let record = rdkafka::producer::FutureRecord::to(topics::COMPLIANCE_EVENTS)
             .key(scan_id.as_bytes())
-            .payload(&serde_json::to_vec(&event)?);
+            .payload(&event_payload);
 
         if let Err((e, _)) = producer
             .send(record, std::time::Duration::from_secs(5))

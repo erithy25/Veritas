@@ -161,7 +161,7 @@ async fn process_message(payload: &[u8], producer: &FutureProducer) -> Result<()
     Ok(())
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 struct IngestRequest {
     upload_id: String,
     video_size_bytes: u64,

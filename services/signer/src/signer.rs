@@ -80,11 +80,11 @@ impl SigningEngine {
             obj.insert(
                 "signature".to_string(),
                 serde_json::json!({
-                    "signature_bytes": hex::encode(signature.to_bytes()),
+                    "signature_bytes": hex::encode(&signature.to_bytes()),
                     "key_id": self.key_id,
                     "algorithm": self.algorithm,
                     "cert_chain_url": self.cert_chain_url,
-                    "content_hash": hex::encode(content_hash),
+                    "content_hash": hex::encode(content_hash.as_slice()),
                     "signed_at": chrono::Utc::now().to_rfc3339(),
                 }),
             );

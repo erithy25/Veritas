@@ -232,8 +232,9 @@ async fn consume_loop(
         let result_json = serde_json::to_vec(&result_envelope)
             .context("Failed to serialize L1 result")?;
 
+        let key = scan_id.to_string();
         let record = FutureRecord::to(topics::L1_RESULTS)
-            .key(&scan_id.to_string())
+            .key(&key)
             .payload(&result_json);
 
         if let Err((e, _)) = producer.send(record, rdkafka::util::Timeout::Never).await {
@@ -261,8 +262,9 @@ async fn consume_loop(
             let escalation_json = serde_json::to_vec(&escalation_envelope)
                 .context("Failed to serialize L2 escalation")?;
 
+            let esc_key = scan_id.to_string();
             let escalation_record = FutureRecord::to(topics::L2_QUEUE)
-                .key(&scan_id.to_string())
+                .key(&esc_key)
                 .payload(&escalation_json);
 
             if let Err((e, _)) = producer
