@@ -1,0 +1,59 @@
+# ═══════════════════════════════════════════════════════════════
+# Multi-stage Dockerfile for Veritas Python ML services
+# Usage: docker build --build-arg SERVICE=l2-biometric -f Dockerfile.python .
+# ═══════════════════════════════════════════════════════════════
+
+# ── Stage 1: Build ────────────────────────────────────────────
+FROM python:3.12-slim-bookworm AS builder
+
+ARG SERVICE
+RUN test -n "${SERVICE}" || (echo "SERVICE build arg required" && exit 1)
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Install pip dependencies
+COPY ml/${SERVICE}/pyproject.toml ./
+RUN pip install --no-cache-dir --prefix=/install .
+
+# Copy application code
+COPY ml/${SERVICE}/src/ /app/src/
+COPY ml/shared/ /app/shared/
+
+# ── Stage 2: Runtime ──────────────────────────────────────────
+FROM python:3.12-slim-bookworm AS runtime
+
+ARG SERVICE
+
+# Install runtime-only system libraries
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r veritas && useradd -r -g veritas -s /bin/false veritas
+
+# Copy installed Python packages
+COPY --from=builder /install /usr/local
+
+# Copy application code
+COPY --from=builder /app /app
+
+WORKDIR /app
+
+# Expose metrics port
+EXPOSE 9090 8080
+
+# Run as non-root
+USER veritas:veritas
+
+# Disable Python output buffering for real-time log visibility
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+ENTRYPOINT ["python", "-m", "src.main"]

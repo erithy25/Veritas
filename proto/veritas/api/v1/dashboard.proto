@@ -1,0 +1,270 @@
+syntax = "proto3";
+
+package veritas.api.v1;
+
+option go_package = "github.com/veritas-security/veritas/gen/go/veritas/api/v1;apiv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/api/annotations.proto";
+import "veritas/api/v1/gateway.proto";
+
+// ═══════════════════════════════════════════════════════════════
+// VeritasDashboard - Moderator dashboard and policy management
+// ═══════════════════════════════════════════════════════════════
+
+service VeritasDashboard {
+  // List flagged content awaiting review
+  rpc ListFlaggedContent (ListFlaggedContentRequest) returns (ListFlaggedContentResponse) {
+    option (google.api.http) = {
+      get: "/v1/dashboard/flagged"
+    };
+  }
+
+  // Get detailed verdict with full XAI explanations
+  rpc GetVerdictDetail (GetVerdictDetailRequest) returns (VerdictDetail) {
+    option (google.api.http) = {
+      get: "/v1/dashboard/verdicts/{scan_id}"
+    };
+  }
+
+  // Human moderator override of a verdict
+  rpc OverrideVerdict (OverrideVerdictRequest) returns (OverrideVerdictResponse) {
+    option (google.api.http) = {
+      post: "/v1/dashboard/verdicts/{scan_id}/override"
+      body: "*"
+    };
+  }
+
+  // Get analytics data for dashboards
+  rpc GetAnalytics (GetAnalyticsRequest) returns (AnalyticsResponse) {
+    option (google.api.http) = {
+      get: "/v1/dashboard/analytics"
+    };
+  }
+
+  // Read current tenant policy
+  rpc GetPolicy (GetPolicyRequest) returns (PolicyResponse) {
+    option (google.api.http) = {
+      get: "/v1/policy"
+    };
+  }
+
+  // Update tenant policy
+  rpc UpdatePolicy (UpdatePolicyRequest) returns (PolicyResponse) {
+    option (google.api.http) = {
+      put: "/v1/policy"
+      body: "*"
+    };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Flagged Content
+// ═══════════════════════════════════════════════════════════════
+
+message ListFlaggedContentRequest {
+  // Pagination
+  int32 page_size = 1;   // Max 100
+  string page_token = 2; // Cursor for next page
+
+  // Filters
+  repeated Verdict verdict_filter = 3;
+  optional float min_risk_score = 4;
+  optional float max_risk_score = 5;
+  google.protobuf.Timestamp from_time = 6;
+  google.protobuf.Timestamp to_time = 7;
+  optional bool pending_review_only = 8;
+}
+
+message ListFlaggedContentResponse {
+  repeated FlaggedContentSummary items = 1;
+  string next_page_token = 2;
+  int32 total_count = 3;
+}
+
+message FlaggedContentSummary {
+  string scan_id = 1;
+  string upload_id = 2;
+  Verdict verdict = 3;
+  float risk_score = 4;
+  repeated string top_reason_codes = 5;
+  bool public_figure_detected = 6;
+  bool reviewed = 7;
+  google.protobuf.Timestamp analyzed_at = 8;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Verdict Detail
+// ═══════════════════════════════════════════════════════════════
+
+message GetVerdictDetailRequest {
+  string scan_id = 1;
+}
+
+message VerdictDetail {
+  // Full signed verdict
+  SignedVerdict verdict = 1;
+
+  // Extended XAI data for moderator review
+  XAIDetail xai_detail = 2;
+
+  // Moderation history
+  repeated ModerationHistoryEntry moderation_history = 3;
+}
+
+message XAIDetail {
+  // Per-model confidence breakdown
+  repeated ModelConfidence model_confidences = 1;
+
+  // Artifact heatmap data (base64-encoded image overlay)
+  optional bytes artifact_heatmap_png = 2;
+
+  // Temporal confidence graph (frame-by-frame scores)
+  repeated FrameScore temporal_scores = 3;
+
+  // rPPG waveform data points (for visualization)
+  repeated float rppg_waveform = 4;
+  float rppg_estimated_bpm = 5;
+}
+
+message ModelConfidence {
+  string model_name = 1;
+  string model_version = 2;
+  float confidence = 3;
+  string specialization = 4; // "general", "gan", "temporal", "diffusion", "lipsync"
+}
+
+message FrameScore {
+  uint32 frame_index = 1;
+  float timestamp_seconds = 2;
+  float confidence = 3;
+}
+
+message ModerationHistoryEntry {
+  string reviewer_id = 1;
+  Verdict original_verdict = 2;
+  Verdict new_verdict = 3;
+  string reason = 4;
+  google.protobuf.Timestamp timestamp = 5;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Override
+// ═══════════════════════════════════════════════════════════════
+
+message OverrideVerdictRequest {
+  string scan_id = 1;
+  Verdict new_verdict = 2;
+  string reason = 3; // Mandatory human-readable reason
+  string reviewer_id = 4;
+}
+
+message OverrideVerdictResponse {
+  string scan_id = 1;
+  Verdict original_verdict = 2;
+  Verdict new_verdict = 3;
+  google.protobuf.Timestamp overridden_at = 4;
+  string audit_trail_id = 5;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Analytics
+// ═══════════════════════════════════════════════════════════════
+
+message GetAnalyticsRequest {
+  google.protobuf.Timestamp from_time = 1;
+  google.protobuf.Timestamp to_time = 2;
+  AnalyticsGranularity granularity = 3;
+}
+
+enum AnalyticsGranularity {
+  ANALYTICS_GRANULARITY_UNSPECIFIED = 0;
+  ANALYTICS_GRANULARITY_HOURLY = 1;
+  ANALYTICS_GRANULARITY_DAILY = 2;
+  ANALYTICS_GRANULARITY_WEEKLY = 3;
+  ANALYTICS_GRANULARITY_MONTHLY = 4;
+}
+
+message AnalyticsResponse {
+  // Time-series detection counts
+  repeated TimeSeriesPoint detection_counts = 1;
+
+  // Verdict distribution
+  VerdictDistribution verdict_distribution = 2;
+
+  // Accuracy metrics
+  AccuracyMetrics accuracy = 3;
+
+  // Top reason codes
+  repeated ReasonCodeCount top_reason_codes = 4;
+
+  // Processing performance
+  PerformanceMetrics performance = 5;
+}
+
+message TimeSeriesPoint {
+  google.protobuf.Timestamp timestamp = 1;
+  int64 allow_count = 2;
+  int64 flag_count = 3;
+  int64 block_count = 4;
+  int64 total_count = 5;
+}
+
+message VerdictDistribution {
+  int64 allow = 1;
+  int64 flag = 2;
+  int64 flag_urgent = 3;
+  int64 block = 4;
+}
+
+message AccuracyMetrics {
+  float false_positive_rate = 1;
+  float false_negative_rate = 2;
+  float precision = 3;
+  float recall = 4;
+  float f1_score = 5;
+}
+
+message ReasonCodeCount {
+  string code = 1;
+  int64 count = 2;
+  float avg_confidence = 3;
+}
+
+message PerformanceMetrics {
+  float avg_latency_ms = 1;
+  float p50_latency_ms = 2;
+  float p99_latency_ms = 3;
+  float l3_usage_rate = 4; // % of scans that reached L3
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Policy Management
+// ═══════════════════════════════════════════════════════════════
+
+message GetPolicyRequest {}
+
+message UpdatePolicyRequest {
+  optional float allow_threshold = 1;
+  optional float flag_threshold = 2;
+  optional float flag_urgent_threshold = 3;
+  optional float block_threshold = 4;
+  optional bool enable_l3 = 5;
+  optional int32 max_video_duration_sec = 6;
+  optional string max_resolution = 7;
+  optional bool c2pa_enabled = 8;
+  string change_reason = 9; // Mandatory audit reason
+}
+
+message PolicyResponse {
+  float allow_threshold = 1;
+  float flag_threshold = 2;
+  float flag_urgent_threshold = 3;
+  float block_threshold = 4;
+  bool enable_l3 = 5;
+  int32 max_video_duration_sec = 6;
+  string max_resolution = 7;
+  bool c2pa_enabled = 8;
+  google.protobuf.Timestamp effective_from = 9;
+  string last_changed_by = 10;
+}

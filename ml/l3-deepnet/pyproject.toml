@@ -1,0 +1,22 @@
+[project]
+name = "veritas-l3-deepnet"
+version = "0.1.0"
+description = "Veritas L3 Deep Neural Network inference orchestrator"
+requires-python = ">=3.12"
+dependencies = [
+    "kafka-python-ng>=2.2.2",
+    "numpy>=1.26",
+    "tritonclient[all]>=2.49",
+    "prometheus-client>=0.21",
+    "structlog>=24.4",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=5.0",
+    "ruff>=0.7",
+    "mypy>=1.11",
+]

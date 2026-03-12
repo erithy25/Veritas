@@ -1,0 +1,225 @@
+syntax = "proto3";
+
+package veritas.api.v1;
+
+option go_package = "github.com/veritas-security/veritas/gen/go/veritas/api/v1;apiv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/api/annotations.proto";
+import "veritas/api/v1/gateway.proto";
+
+// ═══════════════════════════════════════════════════════════════
+// VeritasSandbox - Red-team adversarial testing interface
+// ═══════════════════════════════════════════════════════════════
+
+service VeritasSandbox {
+  // Submit an adversarial sample for testing
+  rpc SubmitSample (SubmitSampleRequest) returns (SubmitSampleResponse) {
+    option (google.api.http) = {
+      post: "/v1/sandbox/samples"
+      body: "*"
+    };
+  }
+
+  // Get result of an adversarial sample analysis
+  rpc GetSampleResult (GetSampleResultRequest) returns (SampleResult) {
+    option (google.api.http) = {
+      get: "/v1/sandbox/samples/{sample_id}"
+    };
+  }
+
+  // Stream submit a batch of adversarial samples
+  rpc SubmitBatch (stream SubmitSampleRequest) returns (BatchResponse);
+
+  // Get attack session report
+  rpc GetAttackReport (GetAttackReportRequest) returns (AttackReport) {
+    option (google.api.http) = {
+      get: "/v1/sandbox/reports/{session_id}"
+    };
+  }
+
+  // Get model information in the sandbox
+  rpc GetModelInfo (GetModelInfoRequest) returns (ModelInfoResponse) {
+    option (google.api.http) = {
+      get: "/v1/sandbox/models"
+    };
+  }
+
+  // Get sandbox metrics
+  rpc GetSandboxMetrics (GetSandboxMetricsRequest) returns (SandboxMetrics) {
+    option (google.api.http) = {
+      get: "/v1/sandbox/metrics"
+    };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Sample Submission
+// ═══════════════════════════════════════════════════════════════
+
+message SubmitSampleRequest {
+  // Test session identifier (groups related samples)
+  string session_id = 1;
+
+  // Adversarial sample video data
+  bytes video_data = 2;
+
+  // Attack metadata
+  AttackMetadata attack_info = 3;
+
+  // Video metadata
+  VideoMetadata metadata = 4;
+}
+
+message AttackMetadata {
+  // Category of the adversarial attack
+  AttackCategory category = 1;
+
+  // Description of the attack technique used
+  string technique_description = 2;
+
+  // Known ground truth (is this actually a deepfake?)
+  bool ground_truth_is_deepfake = 3;
+
+  // Generation tool used (if known)
+  string generation_tool = 4;
+
+  // Expected outcome: should the system detect this?
+  string expected_outcome = 5;
+}
+
+enum AttackCategory {
+  ATTACK_CATEGORY_UNSPECIFIED = 0;
+  ATTACK_CATEGORY_FACE_SWAP_EVASION = 1;
+  ATTACK_CATEGORY_GAN_FINGERPRINT_REMOVAL = 2;
+  ATTACK_CATEGORY_TEMPORAL_SMOOTHING = 3;
+  ATTACK_CATEGORY_RPPG_SIMULATION = 4;
+  ATTACK_CATEGORY_METADATA_SPOOFING = 5;
+  ATTACK_CATEGORY_ADVERSARIAL_PATCH = 6;
+  ATTACK_CATEGORY_COMPRESSION_LAUNDERING = 7;
+  ATTACK_CATEGORY_DIFFUSION_EVASION = 8;
+  ATTACK_CATEGORY_AUDIO_DEEPFAKE = 9;
+  ATTACK_CATEGORY_OTHER = 10;
+}
+
+message SubmitSampleResponse {
+  string sample_id = 1;
+  string session_id = 2;
+  google.protobuf.Timestamp submitted_at = 3;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Sample Results
+// ═══════════════════════════════════════════════════════════════
+
+message GetSampleResultRequest {
+  string sample_id = 1;
+}
+
+message SampleResult {
+  string sample_id = 1;
+  string session_id = 2;
+
+  // Full detection result (same as production pipeline)
+  SignedVerdict verdict = 3;
+
+  // Attack assessment
+  bool attack_successful = 4; // Did the attack bypass detection?
+  string vulnerability_assessment = 5;
+
+  // Comparison with ground truth
+  bool ground_truth_match = 6;
+
+  // Processing details
+  google.protobuf.Timestamp analyzed_at = 7;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Batch & Reporting
+// ═══════════════════════════════════════════════════════════════
+
+message BatchResponse {
+  int32 total_submitted = 1;
+  int32 total_processed = 2;
+  int32 attacks_successful = 3;
+  string session_id = 4;
+}
+
+message GetAttackReportRequest {
+  string session_id = 1;
+}
+
+message AttackReport {
+  string session_id = 1;
+  google.protobuf.Timestamp session_start = 2;
+  google.protobuf.Timestamp session_end = 3;
+
+  // Summary statistics
+  int32 total_samples = 4;
+  int32 true_positives = 5;
+  int32 false_negatives = 6;
+  int32 true_negatives = 7;
+  int32 false_positives = 8;
+
+  // Accuracy metrics
+  float detection_rate = 9;
+  float evasion_rate = 10;
+
+  // Per-category breakdown
+  repeated CategoryResult category_results = 11;
+
+  // Vulnerabilities discovered
+  repeated Vulnerability vulnerabilities = 12;
+
+  // Recommendations
+  repeated string recommendations = 13;
+}
+
+message CategoryResult {
+  AttackCategory category = 1;
+  int32 samples_tested = 2;
+  int32 detected = 3;
+  int32 evaded = 4;
+  float detection_rate = 5;
+}
+
+message Vulnerability {
+  string id = 1;
+  string severity = 2; // "CRITICAL", "HIGH", "MEDIUM", "LOW"
+  string description = 3;
+  AttackCategory category = 4;
+  string affected_model = 5;
+  string remediation_suggestion = 6;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Model Info & Metrics
+// ═══════════════════════════════════════════════════════════════
+
+message GetModelInfoRequest {}
+
+message ModelInfoResponse {
+  repeated ModelInfo models = 1;
+  google.protobuf.Timestamp last_synced_with_production = 2;
+}
+
+message ModelInfo {
+  string name = 1;
+  string version = 2;
+  string framework = 3; // "pytorch", "tensorflow", "onnx"
+  string specialization = 4;
+  google.protobuf.Timestamp deployed_at = 5;
+}
+
+message GetSandboxMetricsRequest {
+  optional string session_id = 1;
+}
+
+message SandboxMetrics {
+  int32 total_sessions = 1;
+  int32 total_samples_tested = 2;
+  float overall_detection_rate = 3;
+  float overall_evasion_rate = 4;
+  repeated CategoryResult category_summary = 5;
+  google.protobuf.Timestamp metrics_since = 6;
+}

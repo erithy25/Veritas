@@ -1,0 +1,391 @@
+syntax = "proto3";
+
+package veritas.api.v1;
+
+option go_package = "github.com/veritas-security/veritas/gen/go/veritas/api/v1;apiv1";
+option java_package = "com.veritas.api.v1";
+option java_multiple_files = true;
+
+import "google/protobuf/timestamp.proto";
+import "google/api/annotations.proto";
+
+// ═══════════════════════════════════════════════════════════════
+// VeritasAnalysis - Primary analysis service for platform integration
+// ═══════════════════════════════════════════════════════════════
+
+service VeritasAnalysis {
+  // Synchronous analysis - blocks until full analysis completes
+  // Use for platforms requiring pre-publication content review
+  rpc AnalyzeVideo (AnalyzeVideoRequest) returns (AnalyzeVideoResponse) {
+    option (google.api.http) = {
+      post: "/v1/analyze"
+      body: "*"
+    };
+  }
+
+  // Streaming upload for large videos (>50MB)
+  // Client streams video chunks, server returns final verdict
+  rpc AnalyzeVideoStream (stream VideoChunk) returns (AnalyzeVideoResponse);
+
+  // Asynchronous analysis - returns immediately with scan_id
+  // Result delivered via webhook or polling
+  rpc AnalyzeVideoAsync (AnalyzeVideoRequest) returns (AsyncAnalysisResponse) {
+    option (google.api.http) = {
+      post: "/v1/analyze/async"
+      body: "*"
+    };
+  }
+
+  // Check status of an async analysis
+  rpc GetAnalysisStatus (GetAnalysisStatusRequest) returns (AnalysisStatus) {
+    option (google.api.http) = {
+      get: "/v1/analyze/{scan_id}/status"
+    };
+  }
+
+  // Retrieve a previously generated verdict by scan_id or upload_id
+  rpc GetVerdict (GetVerdictRequest) returns (SignedVerdict) {
+    option (google.api.http) = {
+      get: "/v1/verdicts/{scan_id}"
+    };
+  }
+
+  // Server-streaming RPC for real-time verdict feed (dashboard integration)
+  rpc StreamVerdicts (StreamVerdictsRequest) returns (stream SignedVerdict);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Request Messages
+// ═══════════════════════════════════════════════════════════════
+
+message AnalyzeVideoRequest {
+  // Platform-assigned upload identifier (used as idempotency key)
+  // If a request with the same upload_id was already processed,
+  // the cached result is returned without re-analysis
+  string upload_id = 1;
+
+  // Raw video bytes (max 500MB for non-streaming, use AnalyzeVideoStream for larger)
+  bytes video_data = 2;
+
+  // Platform-provided video metadata
+  VideoMetadata metadata = 3;
+
+  // Optional analysis configuration overrides
+  AnalysisConfig config = 4;
+}
+
+message VideoChunk {
+  // Must be consistent across all chunks of the same upload
+  string upload_id = 1;
+
+  // 0-indexed chunk sequence number
+  uint32 chunk_index = 2;
+
+  // Total number of chunks expected
+  uint32 total_chunks = 3;
+
+  // Chunk payload (recommended: 1MB per chunk)
+  bytes data = 4;
+
+  // Video metadata (required in first chunk only, chunk_index=0)
+  VideoMetadata metadata = 5;
+}
+
+message VideoMetadata {
+  // Original filename (informational, not used for processing)
+  string filename = 1;
+
+  // MIME type (e.g., "video/mp4", "video/webm")
+  string content_type = 2;
+
+  // Video duration in seconds (if known by platform)
+  float duration_seconds = 3;
+
+  // Resolution string (e.g., "1920x1080", "3840x2160")
+  string resolution = 4;
+
+  // Platform-specific context key-value pairs
+  // Example: {"channel_id": "UC...", "is_live": "false"}
+  map<string, string> platform_context = 5;
+
+  // Platform's trust score for the uploading account (0.0 = untrusted, 1.0 = fully trusted)
+  optional float account_trust_score = 6;
+
+  // Platform content category (e.g., "news", "entertainment", "education")
+  string content_category = 7;
+
+  // ISO 3166-1 alpha-2 country code of uploader (for geo-policy enforcement)
+  string uploader_country = 8;
+}
+
+message AnalysisConfig {
+  // Maximum detection tier to execute (1=L1 only, 2=L1+L2, 3=full pipeline)
+  // Default: 3 (full analysis)
+  optional uint32 max_tier = 1;
+
+  // Processing priority
+  optional Priority priority = 2;
+
+  // Webhook URL for async result delivery (required for AnalyzeVideoAsync)
+  string webhook_url = 3;
+
+  // HMAC secret for webhook signature verification
+  // If not provided, the tenant's default webhook secret is used
+  string webhook_secret = 4;
+
+  // Include C2PA content credentials manifest in response
+  optional bool include_c2pa = 5;
+
+  // Include detailed XAI explanations in response
+  optional bool include_explanations = 6;
+
+  // Override default policy thresholds for this request only
+  optional PolicyOverride policy_override = 7;
+}
+
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_LOW = 1;
+  PRIORITY_NORMAL = 2;
+  PRIORITY_HIGH = 3;
+  PRIORITY_CRITICAL = 4;
+}
+
+message PolicyOverride {
+  // Custom threshold overrides (must be within tenant's allowed range)
+  optional float allow_threshold = 1;
+  optional float flag_threshold = 2;
+  optional float block_threshold = 3;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Response Messages
+// ═══════════════════════════════════════════════════════════════
+
+message AnalyzeVideoResponse {
+  // Complete signed verdict
+  SignedVerdict verdict = 1;
+
+  // C2PA manifest bytes (if requested via config.include_c2pa)
+  optional bytes c2pa_manifest = 2;
+
+  // Processing statistics
+  ProcessingStats stats = 3;
+}
+
+message AsyncAnalysisResponse {
+  // Unique scan identifier for status polling
+  string scan_id = 1;
+
+  // Estimated analysis completion time
+  google.protobuf.Timestamp estimated_completion = 2;
+
+  // REST URL for status polling
+  string status_url = 3;
+}
+
+message SignedVerdict {
+  // Unique scan identifier (UUID v7, time-ordered)
+  string scan_id = 1;
+
+  // Original upload_id from the request
+  string upload_id = 2;
+
+  // Final verdict decision
+  Verdict verdict = 3;
+
+  // Composite risk score (0.0 = safe, 1.0 = highest risk)
+  float risk_score = 4;
+
+  // Per-tier detection results
+  DetectionResults detection_results = 5;
+
+  // XAI reason codes explaining the decision
+  repeated ReasonCode reason_codes = 6;
+
+  // Contextual analysis results
+  ContextAnalysis context = 7;
+
+  // Cryptographic signature over the verdict
+  CryptoSignature signature = 8;
+
+  // Analysis timestamp
+  google.protobuf.Timestamp analyzed_at = 9;
+
+  // Model versions used (model_name → version string)
+  map<string, string> model_versions = 10;
+
+  // AWS/GCP region where processing occurred (for data residency audit)
+  string processing_region = 11;
+}
+
+enum Verdict {
+  VERDICT_UNSPECIFIED = 0;
+  VERDICT_ALLOW = 1;       // Content passed all checks
+  VERDICT_FLAG = 2;        // Content published but flagged for human review
+  VERDICT_FLAG_URGENT = 3; // Content held pending human review within 1 hour
+  VERDICT_BLOCK = 4;       // Content blocked, creator notified
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Detection Result Messages
+// ═══════════════════════════════════════════════════════════════
+
+message DetectionResults {
+  L1Result l1 = 1;
+  optional L2Result l2 = 2;
+  optional L3Result l3 = 3;
+  uint32 highest_tier_executed = 4;
+}
+
+message L1Result {
+  bool hash_match_found = 1;
+  string hash_match_database_id = 2;
+  float metadata_anomaly_score = 3;
+  float compression_anomaly_score = 4;
+  optional bool c2pa_chain_valid = 5;
+  repeated string detected_editing_tools = 6;
+  uint32 duration_ms = 7;
+}
+
+message L2Result {
+  float micro_flicker_score = 1;
+  float rppg_absence_score = 2;
+  float rppg_signal_quality = 3;
+  float eye_movement_anomaly_score = 4;
+  float skin_texture_anomaly_score = 5;
+  float facial_symmetry_score = 6;
+  uint32 faces_analyzed = 7;
+  uint32 duration_ms = 8;
+}
+
+message L3Result {
+  float vit_general_score = 1;
+  float efficientnet_gan_score = 2;
+  float tcn_temporal_score = 3;
+  float diffusion_artifact_score = 4;
+  float lipsync_mismatch_score = 5;
+  float ensemble_score = 6;
+  float model_agreement_ratio = 7;
+  uint32 duration_ms = 8;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// XAI (Explainable AI) Messages
+// ═══════════════════════════════════════════════════════════════
+
+message ReasonCode {
+  // Machine-readable code (e.g., "BIO_RPPG_ABSENT", "DNN_GAN_ARTIFACT")
+  string code = 1;
+
+  // Category grouping
+  ReasonCategory category = 2;
+
+  // Default English explanation
+  string explanation = 3;
+
+  // Confidence for this specific signal (0.0 - 1.0)
+  float confidence = 4;
+
+  // Localized explanations (ISO 639-1 → localized text)
+  map<string, string> localized_explanations = 5;
+}
+
+enum ReasonCategory {
+  REASON_CATEGORY_UNSPECIFIED = 0;
+  REASON_CATEGORY_L1_METADATA = 1;
+  REASON_CATEGORY_L1_HASH = 2;
+  REASON_CATEGORY_L2_BIOMETRIC = 3;
+  REASON_CATEGORY_L3_NEURAL = 4;
+  REASON_CATEGORY_CONTEXT = 5;
+}
+
+message ContextAnalysis {
+  bool public_figure_detected = 1;
+  float public_figure_confidence = 2;
+  float political_context_score = 3;
+  float account_trust_score = 4;
+  float upload_volume_anomaly_score = 5;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Cryptographic Signature
+// ═══════════════════════════════════════════════════════════════
+
+message CryptoSignature {
+  // Ed25519 signature over SHA-512 hash of canonical verdict JSON
+  bytes signature_bytes = 1;
+
+  // Identifier of the signing key (maps to HSM key handle)
+  string key_id = 2;
+
+  // Signing algorithm used
+  string algorithm = 3; // "Ed25519"
+
+  // URL to retrieve the public key and certificate chain (JWK format)
+  string cert_chain_url = 4;
+
+  // SHA-512 hash of the canonical signed content
+  bytes content_hash = 5;
+
+  // Signing timestamp from HSM
+  google.protobuf.Timestamp signed_at = 6;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Processing Statistics
+// ═══════════════════════════════════════════════════════════════
+
+message ProcessingStats {
+  uint32 total_duration_ms = 1;
+  uint32 frames_extracted = 2;
+  uint32 faces_detected = 3;
+  repeated uint32 tiers_executed = 4;
+  string edge_node_id = 5;
+  string analysis_region = 6;
+  uint64 video_size_bytes = 7;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Status & Retrieval Messages
+// ═══════════════════════════════════════════════════════════════
+
+message GetAnalysisStatusRequest {
+  string scan_id = 1;
+}
+
+message AnalysisStatus {
+  string scan_id = 1;
+  AnalysisState state = 2;
+  float progress = 3;
+  string current_stage = 4;
+  google.protobuf.Timestamp estimated_completion = 5;
+  optional SignedVerdict verdict = 6;
+  optional string error_message = 7;
+}
+
+enum AnalysisState {
+  ANALYSIS_STATE_UNSPECIFIED = 0;
+  ANALYSIS_STATE_QUEUED = 1;
+  ANALYSIS_STATE_INGESTING = 2;
+  ANALYSIS_STATE_L1_SCANNING = 3;
+  ANALYSIS_STATE_L2_SCANNING = 4;
+  ANALYSIS_STATE_L3_SCANNING = 5;
+  ANALYSIS_STATE_SCORING = 6;
+  ANALYSIS_STATE_SIGNING = 7;
+  ANALYSIS_STATE_COMPLETED = 8;
+  ANALYSIS_STATE_FAILED = 9;
+}
+
+message GetVerdictRequest {
+  oneof identifier {
+    string scan_id = 1;
+    string upload_id = 2;
+  }
+}
+
+message StreamVerdictsRequest {
+  repeated Verdict verdict_filter = 1;
+  optional float min_risk_score = 2;
+  bool include_explanations = 3;
+}

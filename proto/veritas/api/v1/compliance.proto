@@ -1,0 +1,198 @@
+syntax = "proto3";
+
+package veritas.api.v1;
+
+option go_package = "github.com/veritas-security/veritas/gen/go/veritas/api/v1;apiv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/api/annotations.proto";
+import "veritas/api/v1/gateway.proto";
+
+// ═══════════════════════════════════════════════════════════════
+// VeritasCompliance - Regulatory reporting and signature verification
+// ═══════════════════════════════════════════════════════════════
+
+service VeritasCompliance {
+  // Generate a compliance report (EU AI Act, GDPR, DSA)
+  rpc GenerateReport (GenerateReportRequest) returns (ReportResponse) {
+    option (google.api.http) = {
+      post: "/v1/compliance/reports"
+      body: "*"
+    };
+  }
+
+  // Get status of a report generation job
+  rpc GetReportStatus (GetReportStatusRequest) returns (ReportStatus) {
+    option (google.api.http) = {
+      get: "/v1/compliance/reports/{report_id}"
+    };
+  }
+
+  // Download a generated report
+  rpc DownloadReport (DownloadReportRequest) returns (stream ReportChunk);
+
+  // Verify a signed verdict (public, no auth required)
+  rpc VerifySignature (VerifySignatureRequest) returns (VerifySignatureResponse) {
+    option (google.api.http) = {
+      post: "/v1/verify"
+      body: "*"
+    };
+  }
+
+  // Get C2PA manifest for a specific verdict
+  rpc GetC2PAManifest (GetC2PAManifestRequest) returns (C2PAManifestResponse) {
+    option (google.api.http) = {
+      get: "/v1/compliance/c2pa/{scan_id}"
+    };
+  }
+
+  // List compliance incidents
+  rpc ListComplianceIncidents (ListComplianceIncidentsRequest) returns (ListComplianceIncidentsResponse) {
+    option (google.api.http) = {
+      get: "/v1/compliance/incidents"
+    };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Report Generation
+// ═══════════════════════════════════════════════════════════════
+
+message GenerateReportRequest {
+  ReportType report_type = 1;
+  google.protobuf.Timestamp period_start = 2;
+  google.protobuf.Timestamp period_end = 3;
+  OutputFormat format = 4;
+}
+
+enum ReportType {
+  REPORT_TYPE_UNSPECIFIED = 0;
+  REPORT_TYPE_EU_AI_ACT_MONTHLY = 1;
+  REPORT_TYPE_GDPR_QUARTERLY = 2;
+  REPORT_TYPE_DSA_TRANSPARENCY = 3;
+  REPORT_TYPE_INTERNAL_AUDIT = 4;
+  REPORT_TYPE_TENANT_SUMMARY = 5;
+}
+
+enum OutputFormat {
+  OUTPUT_FORMAT_UNSPECIFIED = 0;
+  OUTPUT_FORMAT_PDF = 1;
+  OUTPUT_FORMAT_JSON = 2;
+  OUTPUT_FORMAT_CSV = 3;
+}
+
+message ReportResponse {
+  string report_id = 1;
+  ReportGenerationState state = 2;
+  google.protobuf.Timestamp estimated_completion = 3;
+}
+
+message GetReportStatusRequest {
+  string report_id = 1;
+}
+
+message ReportStatus {
+  string report_id = 1;
+  ReportGenerationState state = 2;
+  float progress = 3;
+  optional string download_url = 4;
+  optional string error_message = 5;
+  google.protobuf.Timestamp created_at = 6;
+  optional google.protobuf.Timestamp completed_at = 7;
+}
+
+enum ReportGenerationState {
+  REPORT_GENERATION_STATE_UNSPECIFIED = 0;
+  REPORT_GENERATION_STATE_QUEUED = 1;
+  REPORT_GENERATION_STATE_GENERATING = 2;
+  REPORT_GENERATION_STATE_SIGNING = 3;
+  REPORT_GENERATION_STATE_COMPLETED = 4;
+  REPORT_GENERATION_STATE_FAILED = 5;
+}
+
+message DownloadReportRequest {
+  string report_id = 1;
+}
+
+message ReportChunk {
+  bytes data = 1;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Signature Verification (Public API)
+// ═══════════════════════════════════════════════════════════════
+
+message VerifySignatureRequest {
+  // The signed verdict to verify
+  SignedVerdict verdict = 1;
+}
+
+message VerifySignatureResponse {
+  // Whether the signature is cryptographically valid
+  bool signature_valid = 1;
+
+  // Whether the content hash matches the verdict content
+  bool content_hash_valid = 2;
+
+  // Signing key information
+  string key_id = 3;
+  string key_status = 4; // "ACTIVE", "ROTATED", "REVOKED"
+  google.protobuf.Timestamp key_valid_until = 5;
+
+  // Certificate chain validation
+  bool certificate_chain_valid = 6;
+  string certificate_issuer = 7;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// C2PA Content Credentials
+// ═══════════════════════════════════════════════════════════════
+
+message GetC2PAManifestRequest {
+  string scan_id = 1;
+}
+
+message C2PAManifestResponse {
+  // C2PA manifest bytes (JUMBF format)
+  bytes manifest = 1;
+
+  // Human-readable summary
+  C2PASummary summary = 2;
+}
+
+message C2PASummary {
+  string claim_generator = 1;
+  bool is_ai_generated = 2;
+  float ai_generated_confidence = 3;
+  string manipulation_type = 4;
+  string analysis_result = 5; // "authentic", "manipulated", "inconclusive"
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Compliance Incidents
+// ═══════════════════════════════════════════════════════════════
+
+message ListComplianceIncidentsRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+  optional string severity_filter = 3;
+  google.protobuf.Timestamp from_time = 4;
+  google.protobuf.Timestamp to_time = 5;
+}
+
+message ListComplianceIncidentsResponse {
+  repeated ComplianceIncident incidents = 1;
+  string next_page_token = 2;
+  int32 total_count = 3;
+}
+
+message ComplianceIncident {
+  string incident_id = 1;
+  string incident_type = 2;
+  string severity = 3;
+  string description = 4;
+  int32 affected_scans = 5;
+  bool reported_to_dpa = 6;
+  google.protobuf.Timestamp created_at = 7;
+  optional google.protobuf.Timestamp resolved_at = 8;
+}

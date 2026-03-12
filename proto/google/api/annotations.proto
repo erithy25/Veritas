@@ -1,0 +1,13 @@
+// Minimal google.api.annotations for gRPC-Gateway compatibility
+syntax = "proto3";
+
+package google.api;
+
+import "google/protobuf/descriptor.proto";
+import "google/api/http.proto";
+
+option go_package = "google.golang.org/genproto/googleapis/api/annotations;annotations";
+
+extend google.protobuf.MethodOptions {
+  HttpRule http = 72295728;
+}

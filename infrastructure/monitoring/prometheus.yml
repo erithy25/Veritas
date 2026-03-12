@@ -1,0 +1,45 @@
+# Veritas B2B - Prometheus Configuration (Local Development)
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: veritas-gateway
+    static_configs:
+      - targets: ['host.docker.internal:9090']
+    metrics_path: /metrics
+
+  - job_name: veritas-ingest
+    static_configs:
+      - targets: ['host.docker.internal:9190']
+    metrics_path: /metrics
+
+  - job_name: veritas-l1-scanner
+    static_configs:
+      - targets: ['host.docker.internal:9290']
+    metrics_path: /metrics
+
+  - job_name: veritas-scorer
+    static_configs:
+      - targets: ['host.docker.internal:9390']
+    metrics_path: /metrics
+
+  - job_name: veritas-signer
+    static_configs:
+      - targets: ['host.docker.internal:9490']
+    metrics_path: /metrics
+
+  - job_name: veritas-l2-biometric
+    static_configs:
+      - targets: ['host.docker.internal:9590']
+    metrics_path: /metrics
+
+  - job_name: veritas-l3-deepnet
+    static_configs:
+      - targets: ['host.docker.internal:9690']
+    metrics_path: /metrics
+
+  - job_name: veritas-compliance
+    static_configs:
+      - targets: ['host.docker.internal:9790']
+    metrics_path: /metrics

@@ -1,0 +1,201 @@
+# ═══════════════════════════════════════════════════════════════
+# Veritas Gateway - gRPC/REST API Gateway
+# Rust-based, high-performance entry point for platform traffic
+# ═══════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: veritas-gateway
+  namespace: veritas
+  labels:
+    app: veritas-gateway
+    component: gateway
+    tier: api
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: veritas-gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 2
+  template:
+    metadata:
+      labels:
+        app: veritas-gateway
+        component: gateway
+        tier: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: veritas-gateway
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: veritas-gateway
+      nodeSelector:
+        veritas.security/role: gateway
+      containers:
+        - name: gateway
+          image: veritas/gateway:latest
+          ports:
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            - name: VERITAS_ENV
+              value: "production"
+            - name: VERITAS_LOG_LEVEL
+              value: "info"
+            - name: VERITAS_LOG_FORMAT
+              value: "json"
+            - name: VERITAS_GRPC_PORT
+              value: "50051"
+            - name: VERITAS_HTTP_PORT
+              value: "8080"
+            - name: VERITAS_METRICS_PORT
+              value: "9090"
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                secretKeyRef:
+                  name: veritas-kafka-credentials
+                  key: bootstrap-servers
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: veritas-redis-credentials
+                  key: url
+            - name: POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: veritas-postgres-credentials
+                  key: url
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          readinessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: tls-certs
+              mountPath: /etc/veritas/tls
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: "100Mi"
+        - name: tls-certs
+          secret:
+            secretName: veritas-gateway-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: veritas-gateway
+  namespace: veritas
+  labels:
+    app: veritas-gateway
+spec:
+  type: ClusterIP
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+      protocol: TCP
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+  selector:
+    app: veritas-gateway
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: veritas-gateway
+  namespace: veritas
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: veritas-gateway
+  minReplicas: 4
+  maxReplicas: 40
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: veritas-gateway
+  namespace: veritas
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: veritas-gateway

@@ -1,0 +1,75 @@
+# Build outputs
+target/
+dist/
+build/
+*.egg-info/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.mypy_cache/
+
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node/TypeScript (Dashboard)
+node_modules/
+.next/
+*.tsbuildinfo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+.env.production
+*.pem
+*.key
+*.crt
+!infrastructure/terraform/**/*.pem
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+!*.tfvars.example
+
+# Docker
+docker-compose.override.yml
+.docker/
+
+# ML Models (large files)
+*.pt
+*.pth
+*.onnx
+*.trt
+*.plan
+models/
+
+# Data
+*.csv
+*.parquet
+datasets/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Secrets
+secrets/
+credentials/

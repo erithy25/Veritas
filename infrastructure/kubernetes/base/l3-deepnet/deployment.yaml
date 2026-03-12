@@ -1,0 +1,246 @@
+# ═══════════════════════════════════════════════════════════════
+# Veritas L3 DeepNet - GPU-accelerated neural network inference
+# Runs NVIDIA Triton Inference Server with model ensemble
+# ═══════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: veritas-l3-deepnet
+  namespace: veritas
+  labels:
+    app: veritas-l3-deepnet
+    component: detection
+    tier: l3
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: veritas-l3-deepnet
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: veritas-l3-deepnet
+        component: detection
+        tier: l3
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: veritas-l3-deepnet
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: veritas-l3-deepnet
+      nodeSelector:
+        veritas.security/role: l3-inference
+        nvidia.com/gpu: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      initContainers:
+        # Download models from S3 to local SSD before starting Triton
+        - name: model-loader
+          image: veritas/model-loader:latest
+          env:
+            - name: MODEL_BUCKET
+              value: "veritas-production-models"
+            - name: MODEL_PATH
+              value: "/models"
+            - name: MODELS
+              value: "vit-l16,efficientnet-b7,tcn,diffusion-detector,lipsync-analyzer"
+          volumeMounts:
+            - name: model-store
+              mountPath: /models
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+      containers:
+        # NVIDIA Triton Inference Server
+        - name: triton
+          image: nvcr.io/nvidia/tritonserver:24.01-py3
+          args:
+            - tritonserver
+            - --model-repository=/models
+            - --model-control-mode=explicit
+            - --load-model=vit-l16
+            - --load-model=efficientnet-b7
+            - --load-model=tcn
+            - --load-model=diffusion-detector
+            - --load-model=lipsync-analyzer
+            - --strict-model-config=false
+            - --log-verbose=0
+            - --metrics-port=9090
+            - --grpc-port=8001
+            - --http-port=8000
+          ports:
+            - name: http
+              containerPort: 8000
+            - name: grpc
+              containerPort: 8001
+            - name: metrics
+              containerPort: 9090
+          resources:
+            requests:
+              cpu: "8"
+              memory: "64Gi"
+              nvidia.com/gpu: "8"
+            limits:
+              cpu: "16"
+              memory: "128Gi"
+              nvidia.com/gpu: "8"
+          readinessProbe:
+            httpGet:
+              path: /v2/health/ready
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /v2/health/live
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          volumeMounts:
+            - name: model-store
+              mountPath: /models
+              readOnly: true
+            - name: shm
+              mountPath: /dev/shm
+        # Orchestrator sidecar - manages Kafka consumption and result publishing
+        - name: orchestrator
+          image: veritas/l3-orchestrator:latest
+          ports:
+            - name: health
+              containerPort: 8090
+          env:
+            - name: VERITAS_ENV
+              value: "production"
+            - name: TRITON_GRPC_URL
+              value: "localhost:8001"
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                secretKeyRef:
+                  name: veritas-kafka-credentials
+                  key: bootstrap-servers
+            - name: KAFKA_CONSUMER_GROUP
+              value: "veritas-l3-deepnet"
+            - name: KAFKA_INPUT_TOPIC
+              value: "veritas.l3.queue"
+            - name: KAFKA_OUTPUT_TOPIC
+              value: "veritas.l3.results"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: model-store
+          emptyDir:
+            sizeLimit: "200Gi"
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "16Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: veritas-l3-deepnet
+  namespace: veritas
+spec:
+  type: ClusterIP
+  ports:
+    - name: triton-grpc
+      port: 8001
+      targetPort: 8001
+    - name: triton-http
+      port: 8000
+      targetPort: 8000
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+  selector:
+    app: veritas-l3-deepnet
+---
+# Custom HPA using Kafka consumer lag as scaling metric
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: veritas-l3-deepnet
+  namespace: veritas
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: veritas-l3-deepnet
+  minReplicas: 2
+  maxReplicas: 32
+  metrics:
+    # Scale based on GPU utilization
+    - type: Pods
+      pods:
+        metric:
+          name: gpu_utilization_percent
+        target:
+          type: AverageValue
+          averageValue: "80"
+    # Scale based on Kafka consumer lag
+    - type: External
+      external:
+        metric:
+          name: kafka_consumer_lag
+          selector:
+            matchLabels:
+              topic: veritas.l3.queue
+              consumer_group: veritas-l3-deepnet
+        target:
+          type: AverageValue
+          averageValue: "5000"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 120
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: veritas-l3-deepnet
+  namespace: veritas
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: veritas-l3-deepnet

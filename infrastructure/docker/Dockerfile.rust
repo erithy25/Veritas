@@ -1,0 +1,65 @@
+# ═══════════════════════════════════════════════════════════════
+# Multi-stage Dockerfile for Veritas Rust services
+# Usage: docker build --build-arg SERVICE=gateway -f Dockerfile.rust .
+# ═══════════════════════════════════════════════════════════════
+
+# ── Stage 1: Build ────────────────────────────────────────────
+FROM rust:1.82-bookworm AS builder
+
+ARG SERVICE
+RUN test -n "${SERVICE}" || (echo "SERVICE build arg required" && exit 1)
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    protobuf-compiler \
+    librdkafka-dev \
+    cmake \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy workspace manifests first for dependency caching
+COPY Cargo.toml Cargo.lock ./
+COPY services/shared/Cargo.toml services/shared/Cargo.toml
+COPY services/gateway/Cargo.toml services/gateway/Cargo.toml
+COPY services/ingest/Cargo.toml services/ingest/Cargo.toml
+COPY services/l1-scanner/Cargo.toml services/l1-scanner/Cargo.toml
+COPY services/scorer/Cargo.toml services/scorer/Cargo.toml
+COPY services/signer/Cargo.toml services/signer/Cargo.toml
+COPY services/compliance/Cargo.toml services/compliance/Cargo.toml
+
+# Create dummy src files so cargo can resolve the dependency graph
+RUN for dir in services/shared services/gateway services/ingest services/l1-scanner services/scorer services/signer services/compliance; do \
+    mkdir -p $dir/src && echo "fn main() {}" > $dir/src/main.rs && echo "" > $dir/src/lib.rs; \
+    done
+
+# Build dependencies only (cached layer)
+RUN cargo build --release --package veritas-${SERVICE} 2>/dev/null || true
+
+# Copy actual source code
+COPY proto/ proto/
+COPY services/ services/
+
+# Touch source files to invalidate the dummy builds
+RUN find services -name "*.rs" -exec touch {} +
+
+# Build the target service
+RUN cargo build --release --package veritas-${SERVICE}
+
+# ── Stage 2: Runtime ──────────────────────────────────────────
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+
+ARG SERVICE
+
+# Copy the compiled binary
+COPY --from=builder /build/target/release/veritas-${SERVICE} /usr/local/bin/service
+
+# Expose standard ports
+EXPOSE 50051 9090 8080
+
+# Run as non-root user (distroless nonroot UID=65532)
+USER nonroot:nonroot
+
+ENTRYPOINT ["/usr/local/bin/service"]

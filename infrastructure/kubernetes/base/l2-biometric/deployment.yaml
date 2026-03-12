@@ -1,0 +1,219 @@
+# ═══════════════════════════════════════════════════════════════
+# Veritas L2 Biometric - Biometric inconsistency analysis
+# Python-based, optional GPU acceleration
+# CRITICAL: Zero-retention architecture - no persistent volumes
+# ═══════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: veritas-l2-biometric
+  namespace: veritas
+  labels:
+    app: veritas-l2-biometric
+    component: detection
+    tier: l2
+    privacy: biometric-processing
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: veritas-l2-biometric
+  template:
+    metadata:
+      labels:
+        app: veritas-l2-biometric
+        component: detection
+        tier: l2
+        privacy: biometric-processing
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        # Mark pod for zero-retention verification scanner
+        veritas.security/biometric-processing: "true"
+        veritas.security/zero-retention: "required"
+    spec:
+      serviceAccountName: veritas-l2-biometric
+      nodeSelector:
+        veritas.security/role: l2-biometric
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      # SECURITY: No persistent volumes allowed on biometric processing pods
+      # All storage is memory-backed (tmpfs)
+      containers:
+        - name: l2-biometric
+          image: veritas/l2-biometric:latest
+          ports:
+            - name: metrics
+              containerPort: 9090
+          env:
+            - name: VERITAS_ENV
+              value: "production"
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                secretKeyRef:
+                  name: veritas-kafka-credentials
+                  key: bootstrap-servers
+            - name: KAFKA_CONSUMER_GROUP
+              value: "veritas-l2-biometric"
+            - name: KAFKA_INPUT_TOPIC
+              value: "veritas.l2.queue"
+            - name: KAFKA_OUTPUT_TOPIC
+              value: "veritas.l2.results"
+            # Disable swap at application level
+            - name: MALLOC_ARENA_MAX
+              value: "2"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: "32Gi"
+              nvidia.com/gpu: "1"
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 9090
+            initialDelaySeconds: 20
+            periodSeconds: 30
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            # CRITICAL: Read-only filesystem prevents any disk writes
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            # Memory-backed temporary storage ONLY
+            - name: tmp
+              mountPath: /tmp
+            - name: scratch
+              mountPath: /scratch
+      volumes:
+        # All volumes are memory-backed (never touches disk)
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: "2Gi"
+        - name: scratch
+          emptyDir:
+            medium: Memory
+            sizeLimit: "8Gi"
+      # Ensure swap is disabled at the node level
+      # (verified by node configuration, not pod-level)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: veritas-l2-biometric
+  namespace: veritas
+spec:
+  type: ClusterIP
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+  selector:
+    app: veritas-l2-biometric
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: veritas-l2-biometric
+  namespace: veritas
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: veritas-l2-biometric
+  minReplicas: 4
+  maxReplicas: 24
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: kafka_consumer_lag
+          selector:
+            matchLabels:
+              topic: veritas.l2.queue
+              consumer_group: veritas-l2-biometric
+        target:
+          type: AverageValue
+          averageValue: "10000"
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+# Network Policy: Strict egress control for biometric processing pods
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: veritas-l2-biometric-netpol
+  namespace: veritas
+spec:
+  podSelector:
+    matchLabels:
+      app: veritas-l2-biometric
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Only allow Prometheus to scrape metrics
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+          podSelector:
+            matchLabels:
+              app: prometheus
+      ports:
+        - port: 9090
+          protocol: TCP
+  egress:
+    # Kafka only
+    - to:
+        - podSelector:
+            matchLabels:
+              app: kafka
+      ports:
+        - port: 9092
+          protocol: TCP
+    # Scorer service only
+    - to:
+        - podSelector:
+            matchLabels:
+              app: veritas-scorer
+      ports:
+        - port: 50051
+          protocol: TCP
+    # DNS resolution
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # DENY ALL other egress (no internet, no databases, no HSM)
