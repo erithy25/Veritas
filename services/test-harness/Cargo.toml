@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "veritas"
 path = "src/demo.rs"
 
+[[bin]]
+name = "veritas-gui"
+path = "src/gui.rs"
+
 [dependencies]
 veritas-shared = { path = "../shared" }
 
@@ -23,3 +27,5 @@ ed25519-dalek.workspace = true
 sha2.workspace = true
 rand.workspace = true
 image.workspace = true
+eframe.workspace = true
+rfd.workspace = true

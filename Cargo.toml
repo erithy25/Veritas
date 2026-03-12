@@ -76,6 +76,10 @@ tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"]
 # Image processing
 image = "0.25"
 
+# GUI
+eframe = "0.31"
+rfd = "0.15"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
