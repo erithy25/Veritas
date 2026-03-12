@@ -7,6 +7,10 @@ edition.workspace = true
 name = "veritas-test"
 path = "src/main.rs"
 
+[[bin]]
+name = "veritas"
+path = "src/demo.rs"
+
 [dependencies]
 veritas-shared = { path = "../shared" }
 
@@ -18,3 +22,4 @@ anyhow.workspace = true
 ed25519-dalek.workspace = true
 sha2.workspace = true
 rand.workspace = true
+image.workspace = true
