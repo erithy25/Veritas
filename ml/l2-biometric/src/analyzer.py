@@ -1,9 +1,19 @@
-"""L2 Biometric Analyzer -- combines rPPG, flicker, and eye signals.
+"""L2 Biometric Analyzer -- comprehensive biometric deepfake detection.
+
+Combines five independent analysis signals:
+1. **rPPG** (dual CHROM+POS): Blood-flow pulse detection with cross-validation
+2. **Micro-flicker + boundary artifacts**: Bounding-box jitter AND pixel-level
+   gradient/color discontinuities at face boundaries
+3. **Eye movement**: Blink dynamics, saccade patterns, left-right coordination,
+   gaze-head coupling (VOR), and pupil dynamics
+4. **Skin texture frequency**: DCT spectral fingerprints, GAN grid artifacts,
+   patch consistency, temporal texture drift
+5. **Facial symmetry**: Bilateral pixel/gradient/frequency symmetry and
+   temporal stability
 
 Receives pre-extracted facial landmarks and frame data from the Kafka
-pipeline, runs all L2 sub-analyses, computes a composite biometric score,
-and decides whether the scan should be escalated to L3 (deep neural network
-inference).
+pipeline, runs all analyses, computes a composite biometric score,
+and decides whether to escalate to L3.
 """
 
 from __future__ import annotations
@@ -20,6 +30,8 @@ import structlog
 from src.eye_analysis import EyeAnalysisResult, analyze_eyes
 from src.flicker import FlickerResult, analyze_flicker
 from src.rppg import RppgResult, analyze_rppg
+from src.symmetry_analysis import SymmetryAnalysisResult, analyze_symmetry
+from src.texture_analysis import TextureAnalysisResult, analyze_texture
 
 logger = structlog.get_logger(__name__)
 
@@ -47,13 +59,14 @@ L2_PASS_TOTAL = Counter(
 # ---------------------------------------------------------------------------
 # Thresholds
 # ---------------------------------------------------------------------------
-# Composite score above which we escalate to L3 for deep analysis.
 _ESCALATION_THRESHOLD: float = 0.35
 
-# Sub-signal weights in the composite score.
-_WEIGHT_RPPG: float = 0.35
-_WEIGHT_FLICKER: float = 0.30
-_WEIGHT_EYE: float = 0.35
+# Sub-signal weights in the composite score (5 signals, sum = 1.0).
+_WEIGHT_RPPG: float = 0.25
+_WEIGHT_FLICKER: float = 0.20
+_WEIGHT_EYE: float = 0.20
+_WEIGHT_TEXTURE: float = 0.20
+_WEIGHT_SYMMETRY: float = 0.15
 
 # Minimum face region area (in pixels) to attempt analysis.
 _MIN_FACE_AREA: int = 64 * 64
@@ -84,6 +97,15 @@ class FaceTrack:
     inter_pupil_distance: float
     """Mean inter-pupil distance in pixels."""
 
+    left_pupil_positions: NDArray[np.float64] | None = None
+    """Per-frame left pupil center (x, y), shape (N, 2), or None."""
+
+    right_pupil_positions: NDArray[np.float64] | None = None
+    """Per-frame right pupil center (x, y), shape (N, 2), or None."""
+
+    head_yaw_estimates: NDArray[np.float64] | None = None
+    """Per-frame head yaw angle in degrees, shape (N,), or None."""
+
 
 @dataclass(frozen=True, slots=True)
 class L2FaceResult:
@@ -93,6 +115,8 @@ class L2FaceResult:
     rppg: RppgResult
     flicker: FlickerResult
     eye: EyeAnalysisResult
+    texture: TextureAnalysisResult
+    symmetry: SymmetryAnalysisResult
     composite_score: float
 
 
@@ -111,6 +135,8 @@ class L2AnalysisResult:
     rppg_absence_score: float = 0.0
     rppg_signal_quality: float = 0.0
     eye_movement_anomaly_score: float = 0.0
+    skin_texture_anomaly_score: float = 0.0
+    facial_symmetry_score: float = 0.0
 
     # Reason codes for explainability
     reason_codes: list[dict[str, object]] = field(default_factory=list)
@@ -120,12 +146,16 @@ def _compute_face_composite(
     rppg: RppgResult,
     flicker: FlickerResult,
     eye: EyeAnalysisResult,
+    texture: TextureAnalysisResult,
+    symmetry: SymmetryAnalysisResult,
 ) -> float:
     """Compute weighted composite score for a single face."""
     score = (
         _WEIGHT_RPPG * rppg.absence_score
         + _WEIGHT_FLICKER * flicker.flicker_score
         + _WEIGHT_EYE * eye.anomaly_score
+        + _WEIGHT_TEXTURE * texture.anomaly_score
+        + _WEIGHT_SYMMETRY * symmetry.anomaly_score
     )
     return float(max(0.0, min(1.0, score)))
 
@@ -141,8 +171,9 @@ def _generate_reason_codes(
             "code": "BIO_RPPG_ABSENT",
             "category": "L2_BIOMETRIC",
             "explanation": (
-                "No plausible blood-flow signal detected in facial skin. "
-                "Genuine faces exhibit periodic color changes from heartbeat."
+                "No plausible blood-flow signal detected via dual CHROM+POS "
+                "analysis. Genuine faces exhibit periodic color changes from "
+                "heartbeat that are consistent across extraction methods."
             ),
             "confidence": result.rppg_absence_score,
         })
@@ -152,8 +183,9 @@ def _generate_reason_codes(
             "code": "BIO_BOUNDARY_FLICKER",
             "category": "L2_BIOMETRIC",
             "explanation": (
-                "High-frequency oscillations detected at face boundaries, "
-                "suggesting frame-level spatial instability from synthesis."
+                "Boundary artifacts detected: high-frequency spatial instability "
+                "and/or gradient discontinuities at face boundaries suggesting "
+                "frame-level synthesis or blending artifacts."
             ),
             "confidence": result.micro_flicker_score,
         })
@@ -163,10 +195,35 @@ def _generate_reason_codes(
             "code": "BIO_EYE_ANOMALY",
             "category": "L2_BIOMETRIC",
             "explanation": (
-                "Eye movement patterns deviate from natural saccade-fixation "
-                "dynamics or blink physiology."
+                "Eye movement patterns deviate from natural behavior: anomalous "
+                "saccade-fixation dynamics, blink patterns, left-right "
+                "coordination, gaze-head coupling, or pupil dynamics."
             ),
             "confidence": result.eye_movement_anomaly_score,
+        })
+
+    if result.skin_texture_anomaly_score > 0.5:
+        codes.append({
+            "code": "BIO_TEXTURE_ANOMALY",
+            "category": "L2_BIOMETRIC",
+            "explanation": (
+                "Skin texture frequency analysis detected anomalies: spectral "
+                "slope deviates from natural 1/f distribution, GAN grid "
+                "artifacts, cross-patch inconsistency, or temporal texture drift."
+            ),
+            "confidence": result.skin_texture_anomaly_score,
+        })
+
+    if result.facial_symmetry_score > 0.5:
+        codes.append({
+            "code": "BIO_SYMMETRY_ANOMALY",
+            "category": "L2_BIOMETRIC",
+            "explanation": (
+                "Facial symmetry pattern is unnatural: bilateral symmetry "
+                "deviates from normal human asymmetry range at pixel, "
+                "gradient, or frequency level."
+            ),
+            "confidence": result.facial_symmetry_score,
         })
 
     return codes
@@ -212,23 +269,39 @@ def analyze_video(
             )
             continue
 
-        # Run all three sub-analyses
+        # Run all five sub-analyses
         rppg_result = analyze_rppg(track.frames, track.skin_masks, fps)
-        flicker_result = analyze_flicker(track.bboxes, fps)
+
+        flicker_result = analyze_flicker(
+            track.bboxes, fps, frames=track.frames,
+        )
+
         eye_result = analyze_eyes(
             track.pupil_positions,
             track.eyelid_openness,
             track.inter_pupil_distance,
             fps,
+            left_pupil_positions=track.left_pupil_positions,
+            right_pupil_positions=track.right_pupil_positions,
+            head_yaw_estimates=track.head_yaw_estimates,
         )
 
-        composite = _compute_face_composite(rppg_result, flicker_result, eye_result)
+        texture_result = analyze_texture(track.frames, track.skin_masks)
+
+        symmetry_result = analyze_symmetry(track.frames, track.bboxes)
+
+        composite = _compute_face_composite(
+            rppg_result, flicker_result, eye_result,
+            texture_result, symmetry_result,
+        )
 
         face_result = L2FaceResult(
             face_id=track.face_id,
             rppg=rppg_result,
             flicker=flicker_result,
             eye=eye_result,
+            texture=texture_result,
+            symmetry=symmetry_result,
             composite_score=composite,
         )
         result.face_results.append(face_result)
@@ -240,6 +313,8 @@ def analyze_video(
             rppg_absence=round(rppg_result.absence_score, 3),
             flicker=round(flicker_result.flicker_score, 3),
             eye_anomaly=round(eye_result.anomaly_score, 3),
+            texture_anomaly=round(texture_result.anomaly_score, 3),
+            symmetry_anomaly=round(symmetry_result.anomaly_score, 3),
         )
 
     result.faces_analyzed = len(result.face_results)
@@ -258,6 +333,12 @@ def analyze_video(
         )
         result.eye_movement_anomaly_score = max(
             fr.eye.anomaly_score for fr in result.face_results
+        )
+        result.skin_texture_anomaly_score = max(
+            fr.texture.anomaly_score for fr in result.face_results
+        )
+        result.facial_symmetry_score = max(
+            fr.symmetry.anomaly_score for fr in result.face_results
         )
         result.composite_score = max(
             fr.composite_score for fr in result.face_results

@@ -4,8 +4,21 @@ Real human eyes exhibit characteristic patterns: saccades (rapid jumps
 between fixation points), micro-saccades, smooth pursuit, and regular blink
 cycles.  GAN/diffusion deepfakes often produce unrealistic eye behavior --
 overly smooth gaze trajectories, unnatural blink timing, or missing saccadic
-dynamics.  This module tracks pupil positions and eyelid state across frames
-to detect such anomalies.
+dynamics.
+
+Additionally, this module detects:
+
+- **Left-right eye coordination anomalies**: In real faces, both eyes move
+  in tandem (vergence).  Deepfakes sometimes generate independent eye
+  movements or perfectly synchronized movements without natural vergence.
+
+- **Gaze-head pose inconsistency**: When a person turns their head, the
+  eyes partially compensate via the vestibulo-ocular reflex (VOR).
+  Deepfakes often fail to reproduce this coupling correctly.
+
+- **Pupil dynamics**: Real pupils respond to light changes with
+  characteristic latency and oscillation patterns (hippus).  Deepfakes
+  often have static or randomly-varying pupil sizes.
 """
 
 from __future__ import annotations
@@ -29,6 +42,15 @@ _SACCADE_VELOCITY_THRESHOLD: float = 0.02
 
 # Minimum frames required for reliable analysis
 _MIN_FRAMES: int = 90  # ~3 seconds at 30 fps
+
+# Left-right eye correlation threshold
+# Real eyes have correlation > 0.85 for horizontal movement
+_LR_CORRELATION_MIN: float = 0.80
+
+# Gaze-head coupling: expected VOR gain (ratio of compensatory eye
+# movement to head movement). Normal range: 0.8-1.2
+_VOR_GAIN_LOW: float = 0.6
+_VOR_GAIN_HIGH: float = 1.4
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +77,15 @@ class EyeAnalysisResult:
 
     saccade_fixation_anomaly: float
     """Anomaly score for saccade-fixation patterns [0, 1]."""
+
+    lr_coordination_anomaly: float
+    """Left-right eye coordination anomaly [0, 1]."""
+
+    gaze_head_coupling_anomaly: float
+    """Gaze-head pose coupling (VOR) anomaly [0, 1]."""
+
+    pupil_dynamics_anomaly: float
+    """Pupil size dynamics anomaly [0, 1]."""
 
 
 def _compute_blink_metrics(
@@ -221,28 +252,262 @@ def _compute_saccade_fixation_metrics(
     return saccade_ratio, pattern_anomaly
 
 
+def _compute_lr_coordination(
+    left_pupil_positions: NDArray[np.float64] | None,
+    right_pupil_positions: NDArray[np.float64] | None,
+) -> float:
+    """Analyze left-right eye movement coordination.
+
+    In natural gaze, both eyes move together (conjugate movements) except
+    during vergence (focusing at different depths).  Deepfakes often
+    generate each eye independently, leading to either:
+    - Perfect correlation (no natural micro-differences)
+    - Low correlation (independent random movements)
+
+    Parameters
+    ----------
+    left_pupil_positions:
+        Per-frame left pupil positions, shape (N, 2), or None.
+    right_pupil_positions:
+        Per-frame right pupil positions, shape (N, 2), or None.
+
+    Returns anomaly score in [0, 1].
+    """
+    if left_pupil_positions is None or right_pupil_positions is None:
+        return 0.0
+
+    n = min(len(left_pupil_positions), len(right_pupil_positions))
+    if n < _MIN_FRAMES:
+        return 0.0
+
+    left = left_pupil_positions[:n]
+    right = right_pupil_positions[:n]
+
+    # Compute velocity vectors for each eye
+    left_vel = np.diff(left, axis=0)
+    right_vel = np.diff(right, axis=0)
+
+    # Horizontal correlation (should be high ~0.9+ for conjugate movement)
+    left_h = left_vel[:, 0]
+    right_h = right_vel[:, 0]
+
+    if left_h.std() < 1e-8 or right_h.std() < 1e-8:
+        # Both eyes static -- could be natural or could be fake
+        return 0.3
+
+    h_corr = float(np.corrcoef(left_h, right_h)[0, 1])
+
+    # Vertical correlation (should also be high)
+    left_v = left_vel[:, 1]
+    right_v = right_vel[:, 1]
+
+    if left_v.std() < 1e-8 or right_v.std() < 1e-8:
+        v_corr = 1.0  # If no vertical movement, assume OK
+    else:
+        v_corr = float(np.corrcoef(left_v, right_v)[0, 1])
+
+    avg_corr = (h_corr + v_corr) / 2.0
+
+    # Score: too low correlation = independent eye movements (fake)
+    # Perfect correlation (>0.99) with no micro-differences is also suspicious
+    if avg_corr < _LR_CORRELATION_MIN:
+        # Low correlation: eyes moving independently
+        anomaly = float(min(1.0, (_LR_CORRELATION_MIN - avg_corr) / 0.3))
+    elif avg_corr > 0.995:
+        # Suspiciously perfect correlation (no natural micro-vergence)
+        anomaly = 0.4
+    else:
+        anomaly = 0.0
+
+    return anomaly
+
+
+def _compute_gaze_head_coupling(
+    pupil_positions: NDArray[np.float64],
+    head_yaw_estimates: NDArray[np.float64] | None,
+    inter_pupil_distance: float,
+) -> float:
+    """Analyze vestibulo-ocular reflex (VOR) coupling between gaze and head pose.
+
+    When the head turns, the eyes reflexively move in the opposite direction
+    to stabilize gaze (VOR).  The gain is normally ~1.0.  Deepfakes often
+    show gaze that moves WITH the head or doesn't compensate at all.
+
+    Parameters
+    ----------
+    pupil_positions:
+        Per-frame average pupil center, shape (N, 2).
+    head_yaw_estimates:
+        Per-frame head yaw angle estimates in degrees, shape (N,), or None.
+        If None, we estimate head rotation from inter-pupil distance changes.
+    inter_pupil_distance:
+        Mean inter-pupil distance for normalization.
+
+    Returns anomaly score in [0, 1].
+    """
+    n = len(pupil_positions)
+    if n < _MIN_FRAMES:
+        return 0.0
+
+    if inter_pupil_distance < 1.0:
+        return 0.0
+
+    # Estimate head rotation from pupil position horizontal velocity
+    # (crude proxy when explicit head pose isn't available)
+    gaze_h = pupil_positions[:, 0]
+
+    if head_yaw_estimates is not None and len(head_yaw_estimates) >= n:
+        head_vel = np.diff(head_yaw_estimates[:n])
+    else:
+        # Use the derivative of mean horizontal position as head estimate
+        # This is a rough proxy -- assume slow gaze drift is head movement
+        from scipy.signal import butter, filtfilt
+
+        nyq = 15.0  # assume 30fps, nyquist = 15
+        # Low-pass filter: head movement is < 2 Hz
+        low = min(2.0 / nyq, 0.99)
+        b, a = butter(2, low, btype="low")
+
+        gaze_smooth = filtfilt(b, a, gaze_h)
+        head_vel = np.diff(gaze_smooth)
+
+    gaze_vel = np.diff(gaze_h) / inter_pupil_distance
+
+    if len(head_vel) == 0 or len(gaze_vel) == 0:
+        return 0.0
+
+    min_len = min(len(head_vel), len(gaze_vel))
+    head_vel = head_vel[:min_len]
+    gaze_vel = gaze_vel[:min_len]
+
+    # Only analyze frames with significant head movement
+    head_speed = np.abs(head_vel)
+    moving_mask = head_speed > np.percentile(head_speed, 70)
+
+    if moving_mask.sum() < 10:
+        return 0.0
+
+    head_moving = head_vel[moving_mask]
+    gaze_moving = gaze_vel[moving_mask]
+
+    # Correlation: should be negative (VOR: eyes oppose head)
+    if head_moving.std() < 1e-8 or gaze_moving.std() < 1e-8:
+        return 0.3
+
+    correlation = float(np.corrcoef(head_moving, gaze_moving)[0, 1])
+
+    # VOR: expect negative correlation (counter-rotation)
+    # Real: correlation ~ -0.5 to -0.9
+    # Deepfake: often positive (gaze follows head) or zero
+    if correlation > 0.0:
+        # Positive correlation: gaze moves WITH head (no VOR)
+        anomaly = float(min(1.0, 0.5 + correlation * 0.5))
+    elif correlation > -0.3:
+        # Weak negative correlation: poor VOR
+        anomaly = float(0.3 * (1.0 - abs(correlation) / 0.3))
+    else:
+        # Strong negative correlation: healthy VOR
+        anomaly = 0.0
+
+    return anomaly
+
+
+def _compute_pupil_dynamics_anomaly(
+    eyelid_openness: NDArray[np.float64],
+    fps: float,
+) -> float:
+    """Analyze pupil dynamics for naturalness.
+
+    Real pupils exhibit:
+    - Hippus: small rhythmic oscillations at ~0.5-1.5 Hz
+    - Consensual response: both pupils react to light simultaneously
+    - Dilation response latency: ~200-500ms after stimulus
+
+    Deepfakes often produce:
+    - Static pupil size (no hippus)
+    - Random pupil size changes
+    - Unnatural high-frequency pupil oscillations
+
+    We use eyelid openness as a proxy since it correlates with pupil
+    visibility and ambient light reaching the retina.
+
+    Returns anomaly score in [0, 1].
+    """
+    n = len(eyelid_openness)
+    if n < _MIN_FRAMES:
+        return 0.0
+
+    # Analyze the variation in eyelid openness during non-blink periods
+    # (as a proxy for pupil dynamics visible through the eye opening)
+    is_open = eyelid_openness > 0.5
+    open_values = eyelid_openness[is_open]
+
+    if len(open_values) < 30:
+        return 0.0
+
+    # Check for natural micro-variations (hippus-like)
+    std_open = float(open_values.std())
+
+    # Real eyes: std ~0.01-0.05 during fixation
+    # Fake eyes: either perfectly static (std < 0.005) or noisy (std > 0.08)
+    if std_open < 0.005:
+        # Suspiciously static
+        static_anomaly = float(min(1.0, (0.005 - std_open) / 0.005))
+    elif std_open > 0.08:
+        # Suspiciously noisy
+        static_anomaly = float(min(1.0, (std_open - 0.08) / 0.1))
+    else:
+        static_anomaly = 0.0
+
+    # Check for temporal autocorrelation
+    # Real hippus has smooth, periodic character (high autocorrelation at lag 1)
+    if len(open_values) > 10:
+        lag1_corr = float(np.corrcoef(open_values[:-1], open_values[1:])[0, 1])
+        # Real: lag-1 autocorrelation ~0.8-0.95 (smooth variation)
+        # Fake: often < 0.5 (random noise) or > 0.99 (perfectly smooth/static)
+        if lag1_corr < 0.5:
+            autocorr_anomaly = float(min(1.0, (0.5 - lag1_corr) / 0.5))
+        elif lag1_corr > 0.99:
+            autocorr_anomaly = 0.3  # Too smooth
+        else:
+            autocorr_anomaly = 0.0
+    else:
+        autocorr_anomaly = 0.0
+
+    return float(max(0.0, min(1.0, 0.5 * static_anomaly + 0.5 * autocorr_anomaly)))
+
+
 def analyze_eyes(
     pupil_positions: NDArray[np.float64],
     eyelid_openness: NDArray[np.float64],
     inter_pupil_distance: float,
     fps: float,
+    left_pupil_positions: NDArray[np.float64] | None = None,
+    right_pupil_positions: NDArray[np.float64] | None = None,
+    head_yaw_estimates: NDArray[np.float64] | None = None,
 ) -> EyeAnalysisResult:
-    """Run eye movement analysis on tracked pupil and eyelid data.
+    """Run comprehensive eye movement analysis.
 
     Parameters
     ----------
     pupil_positions:
-        Per-frame pupil center (x, y) positions, shape (N, 2).
+        Per-frame average pupil center (x, y) positions, shape (N, 2).
     eyelid_openness:
         Per-frame eyelid openness ratio [0, 1], shape (N,).
     inter_pupil_distance:
-        Mean inter-pupil distance in pixels (for scale normalization).
+        Mean inter-pupil distance in pixels.
     fps:
         Video frame rate.
+    left_pupil_positions:
+        Optional per-frame left pupil positions, shape (N, 2).
+    right_pupil_positions:
+        Optional per-frame right pupil positions, shape (N, 2).
+    head_yaw_estimates:
+        Optional per-frame head yaw estimates in degrees, shape (N,).
 
     Returns
     -------
-    EyeAnalysisResult with composite anomaly score and sub-metrics.
+    EyeAnalysisResult with comprehensive anomaly scores.
     """
     n_frames = len(pupil_positions)
 
@@ -260,23 +525,39 @@ def analyze_eyes(
             blink_duration_anomaly=0.0,
             saccade_ratio=0.0,
             saccade_fixation_anomaly=0.0,
+            lr_coordination_anomaly=0.0,
+            gaze_head_coupling_anomaly=0.0,
+            pupil_dynamics_anomaly=0.0,
         )
 
-    # Blink analysis
+    # Original analyses
     blink_rate, blink_rate_anomaly, mean_duration_ms, duration_anomaly = (
         _compute_blink_metrics(eyelid_openness, fps)
     )
 
-    # Saccade-fixation analysis
     saccade_ratio, saccade_fixation_anomaly = _compute_saccade_fixation_metrics(
         pupil_positions, inter_pupil_distance
     )
 
-    # Composite anomaly score (weighted combination)
+    # New analyses
+    lr_coordination_anomaly = _compute_lr_coordination(
+        left_pupil_positions, right_pupil_positions
+    )
+
+    gaze_head_coupling_anomaly = _compute_gaze_head_coupling(
+        pupil_positions, head_yaw_estimates, inter_pupil_distance
+    )
+
+    pupil_dynamics = _compute_pupil_dynamics_anomaly(eyelid_openness, fps)
+
+    # Composite anomaly score with expanded weights
     anomaly_score = float(
-        0.30 * blink_rate_anomaly
-        + 0.25 * duration_anomaly
-        + 0.45 * saccade_fixation_anomaly
+        0.18 * blink_rate_anomaly
+        + 0.14 * duration_anomaly
+        + 0.25 * saccade_fixation_anomaly
+        + 0.15 * lr_coordination_anomaly
+        + 0.15 * gaze_head_coupling_anomaly
+        + 0.13 * pupil_dynamics
     )
     anomaly_score = max(0.0, min(1.0, anomaly_score))
 
@@ -285,10 +566,10 @@ def analyze_eyes(
         anomaly_score=round(anomaly_score, 3),
         blink_rate=round(blink_rate, 1),
         blink_rate_anomaly=round(blink_rate_anomaly, 3),
-        mean_blink_duration_ms=round(mean_duration_ms, 1),
-        blink_duration_anomaly=round(duration_anomaly, 3),
-        saccade_ratio=round(saccade_ratio, 3),
         saccade_fixation_anomaly=round(saccade_fixation_anomaly, 3),
+        lr_coordination=round(lr_coordination_anomaly, 3),
+        gaze_head_coupling=round(gaze_head_coupling_anomaly, 3),
+        pupil_dynamics=round(pupil_dynamics, 3),
         n_frames=n_frames,
     )
 
@@ -300,4 +581,7 @@ def analyze_eyes(
         blink_duration_anomaly=duration_anomaly,
         saccade_ratio=saccade_ratio,
         saccade_fixation_anomaly=saccade_fixation_anomaly,
+        lr_coordination_anomaly=lr_coordination_anomaly,
+        gaze_head_coupling_anomaly=gaze_head_coupling_anomaly,
+        pupil_dynamics_anomaly=pupil_dynamics,
     )

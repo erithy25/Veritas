@@ -110,6 +110,8 @@ class L2BiometricService:
                 "rppg_absence_score": result.rppg_absence_score,
                 "rppg_signal_quality": result.rppg_signal_quality,
                 "eye_movement_anomaly_score": result.eye_movement_anomaly_score,
+                "skin_texture_anomaly_score": result.skin_texture_anomaly_score,
+                "facial_symmetry_score": result.facial_symmetry_score,
                 "composite_score": result.composite_score,
                 "escalate_to_l3": result.escalate_to_l3,
                 "faces_analyzed": result.faces_analyzed,
