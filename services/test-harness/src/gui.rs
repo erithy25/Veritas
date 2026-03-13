@@ -1449,9 +1449,19 @@ fn analyze_metadata(path: &Path, extension: &str, file_size: u64) -> MetadataRes
     let mut detected_tools = Vec::new();
     let mut reasons = Vec::new();
 
-    let file_bytes = std::fs::read(path).unwrap_or_default();
-    let header_str =
-        String::from_utf8_lossy(&file_bytes[..file_bytes.len().min(4096)]).to_lowercase();
+    // Only read the first 8KB for header analysis (NOT the entire file!)
+    let header_bytes = {
+        use std::io::Read;
+        let mut buf = vec![0u8; 8192];
+        if let Ok(mut f) = std::fs::File::open(path) {
+            let n = f.read(&mut buf).unwrap_or(0);
+            buf.truncate(n);
+        } else {
+            buf.clear();
+        }
+        buf
+    };
+    let header_str = String::from_utf8_lossy(&header_bytes).to_lowercase();
 
     for &(pattern, display_name) in DEEPFAKE_TOOL_SIGNATURES {
         if header_str.contains(pattern) {
@@ -1484,18 +1494,25 @@ fn analyze_metadata(path: &Path, extension: &str, file_size: u64) -> MetadataRes
         reasons.push("L1_META_STRIPPED: EXIF/XMP Metadata fehlt".into());
     }
 
-    let resolution = if let Ok(img) = image::open(path) {
-        let (w, h) = (img.width(), img.height());
-        let aspect = w as f64 / h as f64;
-        let standard = [16.0 / 9.0, 9.0 / 16.0, 4.0 / 3.0, 3.0 / 4.0, 1.0];
-        if !standard.iter().any(|&s| (aspect - s).abs() < 0.02) {
-            score += 0.05;
-            reasons.push(format!(
-                "L1_META_NONSTANDARD_ASPECT: Seitenverhaeltnis {:.3} ({}x{})",
-                aspect, w, h
-            ));
+    let is_video_ext = VIDEO_EXTENSIONS.contains(&extension);
+
+    // Only try image::open for non-video files (videos would OOM or fail)
+    let resolution = if !is_video_ext {
+        if let Ok(img) = image::open(path) {
+            let (w, h) = (img.width(), img.height());
+            let aspect = w as f64 / h as f64;
+            let standard = [16.0 / 9.0, 9.0 / 16.0, 4.0 / 3.0, 3.0 / 4.0, 1.0];
+            if !standard.iter().any(|&s| (aspect - s).abs() < 0.02) {
+                score += 0.05;
+                reasons.push(format!(
+                    "L1_META_NONSTANDARD_ASPECT: Seitenverhaeltnis {:.3} ({}x{})",
+                    aspect, w, h
+                ));
+            }
+            Some((w, h))
+        } else {
+            None
         }
-        Some((w, h))
     } else {
         None
     };
