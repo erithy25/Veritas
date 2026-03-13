@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -9,6 +10,8 @@ use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use image::DynamicImage;
 use sha2::{Digest, Sha512};
 use veritas_shared::types::VerdictDecision;
+
+const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "avi", "webm", "mov", "m4v", "flv", "wmv", "3gp"];
 
 // ═══════════════════════════════════════════════════════════════════
 //  Main
@@ -74,6 +77,31 @@ struct AnalysisResult {
     signed_json: String,
     signature_valid: bool,
     latency_ms: f64,
+    // Video-specific
+    is_video: bool,
+    video_info: Option<VideoInfo>,
+    frame_analyses: Vec<FrameAnalysis>,
+}
+
+#[allow(dead_code)]
+struct VideoInfo {
+    duration_secs: f64,
+    fps: f64,
+    total_frames: u64,
+    video_codec: String,
+    audio_codec: String,
+    width: u32,
+    height: u32,
+    bitrate_kbps: u64,
+    frames_extracted: usize,
+}
+
+struct FrameAnalysis {
+    frame_index: usize,
+    timestamp_secs: f64,
+    hashes: HashResult,
+    anomaly_score: f32,
+    reason: String,
 }
 
 struct DemoResult {
@@ -276,7 +304,7 @@ impl VeritasApp {
 
         if ui.add(btn).clicked() && !self.analyzing {
             if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Bilder & Videos", &["jpg", "jpeg", "png", "webp", "gif", "bmp", "mp4", "mkv", "avi", "webm"])
+                .add_filter("Bilder & Videos", &["jpg", "jpeg", "png", "webp", "gif", "bmp", "mp4", "mkv", "avi", "webm", "mov", "m4v", "flv"])
                 .add_filter("Alle Dateien", &["*"])
                 .pick_file()
             {
@@ -308,12 +336,57 @@ impl VeritasApp {
             info_label(ui, "Datei:", &r.file_path);
         });
         ui.horizontal(|ui| {
-            info_label(ui, "Groesse:", &format!("{} bytes", r.file_size));
+            if r.is_video {
+                ui.label(
+                    egui::RichText::new(" VIDEO ")
+                        .size(12.0)
+                        .strong()
+                        .color(egui::Color32::WHITE)
+                        .background_color(egui::Color32::from_rgb(60, 100, 180)),
+                );
+                ui.add_space(8.0);
+            }
+            info_label(ui, "Groesse:", &format_file_size(r.file_size));
             if let Some((w, h)) = r.resolution {
                 ui.add_space(20.0);
                 info_label(ui, "Aufloesung:", &format!("{}x{} px", w, h));
             }
         });
+
+        // Video info
+        if let Some(vi) = &r.video_info {
+            ui.add_space(8.0);
+            let video_card = egui::Frame::new()
+                .fill(egui::Color32::from_rgb(20, 30, 50))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 80, 140)))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(16, 10));
+
+            video_card.show(ui, |ui| {
+                ui.label(egui::RichText::new("Video-Details").strong().size(14.0).color(egui::Color32::from_rgb(100, 160, 255)));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    info_label(ui, "Dauer:", &format_duration(vi.duration_secs));
+                    ui.add_space(16.0);
+                    info_label(ui, "FPS:", &format!("{:.2}", vi.fps));
+                    ui.add_space(16.0);
+                    info_label(ui, "Frames total:", &format!("{}", vi.total_frames));
+                });
+                ui.horizontal(|ui| {
+                    info_label(ui, "Video-Codec:", &vi.video_codec);
+                    ui.add_space(16.0);
+                    info_label(ui, "Audio-Codec:", &vi.audio_codec);
+                    ui.add_space(16.0);
+                    info_label(ui, "Bitrate:", &format!("{} kbps", vi.bitrate_kbps));
+                });
+                ui.horizontal(|ui| {
+                    info_label(ui, "Aufloesung:", &format!("{}x{}", vi.width, vi.height));
+                    ui.add_space(16.0);
+                    info_label(ui, "Frames analysiert:", &format!("{}", vi.frames_extracted));
+                });
+            });
+        }
+
         ui.add_space(12.0);
 
         // Score bars
@@ -384,17 +457,100 @@ impl VeritasApp {
             info_label(ui, "Latenz:", &format!("{:.1}ms", r.latency_ms));
         });
 
-        // Perceptual hashes
-        if let Some(h) = &r.hashes {
+        // Frame-by-frame analysis for videos
+        if !r.frame_analyses.is_empty() {
+            ui.add_space(12.0);
+            section_header(ui, &format!("Frame-Analyse ({} Frames)", r.frame_analyses.len()));
+
+            // Anomaly timeline bar
+            let bar_width = ui.available_width().min(800.0);
+            let bar_height = 40.0;
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(bar_width, bar_height),
+                egui::Sense::hover(),
+            );
+            let painter = ui.painter();
+            painter.rect_filled(rect, egui::CornerRadius::same(4), egui::Color32::from_rgb(30, 30, 45));
+
+            let n = r.frame_analyses.len();
+            if n > 0 {
+                let slot_w = bar_width / n as f32;
+                for (i, fa) in r.frame_analyses.iter().enumerate() {
+                    let x = rect.min.x + i as f32 * slot_w;
+                    let fill = egui::Rect::from_min_size(
+                        egui::pos2(x, rect.min.y),
+                        egui::vec2(slot_w.max(2.0), bar_height),
+                    );
+                    painter.rect_filled(fill, egui::CornerRadius::ZERO, score_color(fa.anomaly_score));
+                }
+            }
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("Timeline: Jeder Block = 1 analysierter Frame (gruen=sicher, rot=verdaechtig)")
+                    .size(11.0)
+                    .color(egui::Color32::from_gray(110)),
+            );
+
             ui.add_space(8.0);
-            section_header(ui, "Perceptual Hashes");
-            ui.horizontal(|ui| {
-                hash_label(ui, "aHash", h.ahash);
-                ui.add_space(16.0);
-                hash_label(ui, "dHash", h.dhash);
-                ui.add_space(16.0);
-                hash_label(ui, "pHash", h.phash);
+
+            // Detailed per-frame results in collapsible
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Frame-Details").size(13.0),
+            )
+            .show(ui, |ui| {
+                egui::Grid::new("frame_grid")
+                    .num_columns(6)
+                    .spacing([12.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        // Header
+                        ui.label(egui::RichText::new("Frame").strong().size(12.0));
+                        ui.label(egui::RichText::new("Zeit").strong().size(12.0));
+                        ui.label(egui::RichText::new("Score").strong().size(12.0));
+                        ui.label(egui::RichText::new("aHash").strong().size(12.0));
+                        ui.label(egui::RichText::new("dHash").strong().size(12.0));
+                        ui.label(egui::RichText::new("Befund").strong().size(12.0));
+                        ui.end_row();
+
+                        for fa in &r.frame_analyses {
+                            ui.label(egui::RichText::new(format!("#{}", fa.frame_index + 1)).monospace().size(12.0));
+                            ui.label(egui::RichText::new(format!("{:.1}s", fa.timestamp_secs)).monospace().size(12.0));
+                            ui.label(
+                                egui::RichText::new(format!("{:.3}", fa.anomaly_score))
+                                    .monospace()
+                                    .size(12.0)
+                                    .color(score_color(fa.anomaly_score)),
+                            );
+                            ui.label(egui::RichText::new(format!("{:016x}", fa.hashes.ahash)).monospace().size(10.0).color(egui::Color32::from_gray(140)));
+                            ui.label(egui::RichText::new(format!("{:016x}", fa.hashes.dhash)).monospace().size(10.0).color(egui::Color32::from_gray(140)));
+                            ui.label(
+                                egui::RichText::new(&fa.reason)
+                                    .size(11.0)
+                                    .color(if fa.anomaly_score > 0.3 {
+                                        egui::Color32::from_rgb(255, 200, 100)
+                                    } else {
+                                        egui::Color32::from_gray(130)
+                                    }),
+                            );
+                            ui.end_row();
+                        }
+                    });
             });
+        }
+
+        // Perceptual hashes (for images)
+        if r.frame_analyses.is_empty() {
+            if let Some(h) = &r.hashes {
+                ui.add_space(8.0);
+                section_header(ui, "Perceptual Hashes");
+                ui.horizontal(|ui| {
+                    hash_label(ui, "aHash", h.ahash);
+                    ui.add_space(16.0);
+                    hash_label(ui, "dHash", h.dhash);
+                    ui.add_space(16.0);
+                    hash_label(ui, "pHash", h.phash);
+                });
+            }
         }
 
         // Detected tools
@@ -773,14 +929,118 @@ impl VeritasApp {
         let extension = path
             .extension()
             .and_then(|e| e.to_str())
-            .unwrap_or("unknown");
+            .unwrap_or("unknown")
+            .to_lowercase();
         let file_size = file_meta.len();
-        let image_result = image::open(path);
-        let resolution = image_result.as_ref().ok().map(|img| (img.width(), img.height()));
+        let is_video = VIDEO_EXTENSIONS.contains(&extension.as_str());
 
-        let metadata = analyze_metadata(path, extension, file_size);
+        let mut metadata = analyze_metadata(path, &extension, file_size);
+        let mut hashes: Option<HashResult> = None;
+        let mut resolution: Option<(u32, u32)> = None;
+        let mut video_info: Option<VideoInfo> = None;
+        let mut frame_analyses: Vec<FrameAnalysis> = Vec::new();
 
-        let hashes = image_result.as_ref().ok().map(compute_perceptual_hashes);
+        if is_video {
+            // Extract video info via ffprobe
+            let vi = probe_video(path);
+
+            // Extract frames via ffmpeg and analyze each
+            let temp_dir = std::env::temp_dir().join(format!("veritas-frames-{}", uuid::Uuid::new_v4()));
+            let _ = std::fs::create_dir_all(&temp_dir);
+
+            let frames = extract_video_frames(path, &temp_dir, &vi);
+
+            let mut max_anomaly: f32 = 0.0;
+            let mut prev_hashes: Option<HashResult> = None;
+
+            for (i, (frame_path, timestamp)) in frames.iter().enumerate() {
+                if let Ok(img) = image::open(frame_path) {
+                    let fh = compute_perceptual_hashes(&img);
+
+                    // Cross-frame consistency check
+                    let mut anomaly: f32 = metadata.anomaly_score * 0.3;
+                    let mut reason = String::from("OK");
+
+                    if let Some(ref prev) = prev_hashes {
+                        let a_dist = hamming_distance(fh.ahash, prev.ahash);
+                        let d_dist = hamming_distance(fh.dhash, prev.dhash);
+                        let p_dist = hamming_distance(fh.phash, prev.phash);
+
+                        // Large perceptual hash jumps between adjacent frames = splice
+                        if p_dist > 20 {
+                            anomaly += 0.4;
+                            reason = format!("SPLICE: pHash-Sprung d={} (>20)", p_dist);
+                            metadata.reasons.push(format!(
+                                "L1_FRAME_SPLICE: Frame {} pHash-Distanz {} (Verdacht auf Splice)",
+                                i + 1, p_dist
+                            ));
+                        } else if d_dist > 25 {
+                            anomaly += 0.25;
+                            reason = format!("JUMP: dHash-Sprung d={} (>25)", d_dist);
+                        } else if a_dist > 15 && d_dist > 15 {
+                            anomaly += 0.15;
+                            reason = format!("SHIFT: Multi-Hash-Aenderung a={} d={}", a_dist, d_dist);
+                        } else {
+                            reason = format!("OK (a={} d={} p={})", a_dist, d_dist, p_dist);
+                        }
+                    }
+
+                    anomaly = anomaly.clamp(0.0, 1.0);
+                    if anomaly > max_anomaly {
+                        max_anomaly = anomaly;
+                    }
+
+                    if i == 0 {
+                        resolution = Some((img.width(), img.height()));
+                        hashes = Some(HashResult {
+                            ahash: fh.ahash,
+                            dhash: fh.dhash,
+                            phash: fh.phash,
+                        });
+                    }
+
+                    frame_analyses.push(FrameAnalysis {
+                        frame_index: i,
+                        timestamp_secs: *timestamp,
+                        hashes: fh,
+                        anomaly_score: anomaly,
+                        reason,
+                    });
+
+                    prev_hashes = Some(HashResult {
+                        ahash: frame_analyses.last().unwrap().hashes.ahash,
+                        dhash: frame_analyses.last().unwrap().hashes.dhash,
+                        phash: frame_analyses.last().unwrap().hashes.phash,
+                    });
+                }
+            }
+
+            // Boost metadata score based on frame analysis
+            if max_anomaly > metadata.anomaly_score {
+                metadata.anomaly_score = (metadata.anomaly_score + max_anomaly) / 2.0;
+            }
+
+            // Count suspicious frames
+            let suspicious_count = frame_analyses.iter().filter(|f| f.anomaly_score > 0.3).count();
+            if suspicious_count > 0 {
+                metadata.reasons.push(format!(
+                    "L1_FRAME_ANALYSIS: {}/{} Frames verdaechtig (Score > 0.3)",
+                    suspicious_count, frame_analyses.len()
+                ));
+            }
+
+            let mut vi = vi;
+            vi.frames_extracted = frame_analyses.len();
+            video_info = Some(vi);
+
+            // Cleanup temp frames
+            let _ = std::fs::remove_dir_all(&temp_dir);
+        } else {
+            // Image analysis (existing logic)
+            let image_result = image::open(path);
+            resolution = image_result.as_ref().ok().map(|img| (img.width(), img.height()));
+            hashes = image_result.as_ref().ok().map(compute_perceptual_hashes);
+        }
 
         let l2 = simulate_l2(&metadata);
         let l3 = simulate_l3(&metadata);
@@ -831,6 +1091,9 @@ impl VeritasApp {
             signed_json,
             signature_valid,
             latency_ms,
+            is_video,
+            video_info,
+            frame_analyses,
         });
     }
 
@@ -915,6 +1178,196 @@ impl VeritasApp {
             valid,
             tampered_valid,
         });
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Video Processing (ffmpeg/ffprobe)
+// ═══════════════════════════════════════════════════════════════════
+
+fn probe_video(path: &Path) -> VideoInfo {
+    let mut vi = VideoInfo {
+        duration_secs: 0.0,
+        fps: 0.0,
+        total_frames: 0,
+        video_codec: "unknown".into(),
+        audio_codec: "none".into(),
+        width: 0,
+        height: 0,
+        bitrate_kbps: 0,
+        frames_extracted: 0,
+    };
+
+    // Use ffprobe to get video info
+    let output = Command::new("ffprobe")
+        .args([
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_format",
+            "-show_streams",
+        ])
+        .arg(path)
+        .output();
+
+    if let Ok(out) = output {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+            // Parse format
+            if let Some(format) = json.get("format") {
+                vi.duration_secs = format
+                    .get("duration")
+                    .and_then(|d| d.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                vi.bitrate_kbps = format
+                    .get("bit_rate")
+                    .and_then(|b| b.as_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    / 1000;
+            }
+
+            // Parse streams
+            if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
+                for stream in streams {
+                    let codec_type = stream
+                        .get("codec_type")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("");
+
+                    if codec_type == "video" {
+                        vi.video_codec = stream
+                            .get("codec_name")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        vi.width = stream
+                            .get("width")
+                            .and_then(|w| w.as_u64())
+                            .unwrap_or(0) as u32;
+                        vi.height = stream
+                            .get("height")
+                            .and_then(|h| h.as_u64())
+                            .unwrap_or(0) as u32;
+
+                        // Parse fps from r_frame_rate (e.g. "30/1" or "30000/1001")
+                        if let Some(rate) = stream.get("r_frame_rate").and_then(|r| r.as_str()) {
+                            let parts: Vec<&str> = rate.split('/').collect();
+                            if parts.len() == 2 {
+                                let num = parts[0].parse::<f64>().unwrap_or(0.0);
+                                let den = parts[1].parse::<f64>().unwrap_or(1.0);
+                                if den > 0.0 {
+                                    vi.fps = num / den;
+                                }
+                            }
+                        }
+
+                        // Total frames
+                        vi.total_frames = stream
+                            .get("nb_frames")
+                            .and_then(|n| n.as_str())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or_else(|| {
+                                if vi.fps > 0.0 {
+                                    (vi.duration_secs * vi.fps) as u64
+                                } else {
+                                    0
+                                }
+                            });
+                    } else if codec_type == "audio" {
+                        vi.audio_codec = stream
+                            .get("codec_name")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("none")
+                            .to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    vi
+}
+
+/// Extract up to N frames from a video using ffmpeg scene detection + interval sampling.
+fn extract_video_frames(path: &Path, temp_dir: &Path, vi: &VideoInfo) -> Vec<(PathBuf, f64)> {
+    let mut frames: Vec<(PathBuf, f64)> = Vec::new();
+
+    // Strategy: extract ~20 frames spread across the video
+    // Use scene detection + fixed interval sampling
+    let max_frames: usize = 20;
+    let interval = if vi.duration_secs > 0.0 {
+        (vi.duration_secs / max_frames as f64).max(0.5)
+    } else {
+        1.0
+    };
+
+    // Method 1: ffmpeg with fps filter for interval-based extraction
+    let output_pattern = temp_dir.join("frame_%04d.png");
+    let fps_filter = format!("fps=1/{:.2}", interval);
+
+    let result = Command::new("ffmpeg")
+        .args([
+            "-i",
+        ])
+        .arg(path)
+        .args([
+            "-vf", &fps_filter,
+            "-frames:v", &max_frames.to_string(),
+            "-q:v", "2",
+            "-y",
+        ])
+        .arg(&output_pattern)
+        .output();
+
+    if result.is_err() {
+        return frames;
+    }
+
+    // Collect extracted frames
+    if let Ok(entries) = std::fs::read_dir(temp_dir) {
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "png"))
+            .collect();
+        paths.sort();
+
+        for (i, frame_path) in paths.into_iter().enumerate() {
+            let timestamp = i as f64 * interval;
+            frames.push((frame_path, timestamp));
+        }
+    }
+
+    frames
+}
+
+/// Hamming distance for cross-frame comparison.
+fn hamming_distance(a: u64, b: u64) -> u32 {
+    (a ^ b).count_ones()
+}
+
+fn format_duration(secs: f64) -> String {
+    let total = secs as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    let ms = ((secs - secs.floor()) * 100.0) as u64;
+    if h > 0 {
+        format!("{}:{:02}:{:02}.{:02}", h, m, s, ms)
+    } else {
+        format!("{}:{:02}.{:02}", m, s, ms)
+    }
+}
+
+fn format_file_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     }
 }
 
